@@ -1,0 +1,6 @@
+Flask
+SQLAlchemy
+psycopg2-binary # For PostgreSQL on Railway, if needed, otherwise sqlite3 is built-in
+python-dotenv
+requests
+beautifulsoup4
