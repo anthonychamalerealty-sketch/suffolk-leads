@@ -25,6 +25,7 @@ scraper.log
 # Environment files
 .env
 .env.*
+!.env.example
 
 # IDE
 .idea/

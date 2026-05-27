@@ -1,7 +1,8 @@
 Flask
 SQLAlchemy
-psycopg2-binary # For PostgreSQL on Railway, if needed, otherwise sqlite3 is built-in
+psycopg2-binary      # For PostgreSQL on Railway; sqlite3 is built-in for local dev
 python-dotenv
 requests
 beautifulsoup4
-playwright       # Tier 1b — USPhoneBook.com scraping (run: playwright install chromium)
+playwright           # Tier 1b — USPhoneBook.com scraping (run: playwright install chromium)
+sendgrid             # Email delivery for jobs/daily_digest.py

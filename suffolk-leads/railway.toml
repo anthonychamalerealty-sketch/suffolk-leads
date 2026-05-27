@@ -1,3 +1,12 @@
+# railway.toml — Main application service
+# ─────────────────────────────────────────────────────────────────────────────
+# This file configures the primary long-running service (API + scheduler).
+#
+# For the daily digest cron job, see railway-cron.toml.
+# That file is used by a separate Railway service that runs
+# `python jobs/daily_digest.py` at 7:00 AM Eastern Time (11:00 AM UTC) daily.
+# ─────────────────────────────────────────────────────────────────────────────
+
 [build]
 builder = "Nixpacks"
 

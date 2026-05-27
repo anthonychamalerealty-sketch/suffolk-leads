@@ -1,0 +1,28 @@
+# railway-cron.toml
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration for the "Daily Digest" cron service on Railway.
+#
+# How to use:
+#   1. In your Railway project, click "+ New Service" → "GitHub Repo".
+#   2. Point it to the same suffolk-leads repository.
+#   3. In Service Settings → Source → "Config file path", enter:
+#        suffolk-leads/railway-cron.toml
+#   4. Set the following environment variables in the Railway service dashboard:
+#        DATABASE_URL       — shared PostgreSQL connection string
+#        SENDGRID_API_KEY   — your SendGrid API key
+#        DIGEST_EMAIL       — Anthonychamalerealty@gmail.com
+#   5. Railway will run `python jobs/daily_digest.py` at 07:00 AM Eastern Time
+#      (11:00 AM UTC) every day.  The service exits when the script completes.
+#
+# Note: Railway cron schedules are UTC-based.
+#   EDT (UTC-4): 7 AM EDT = 11:00 UTC  → "0 11 * * *"
+#   EST (UTC-5): 7 AM EST = 12:00 UTC  → "0 12 * * *"
+# ─────────────────────────────────────────────────────────────────────────────
+
+[build]
+builder = "Nixpacks"
+
+[deploy]
+startCommand = "python jobs/daily_digest.py"
+cronSchedule = "0 11 * * *"
+restartPolicyType = "never"
