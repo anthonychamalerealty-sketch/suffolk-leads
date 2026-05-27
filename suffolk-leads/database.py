@@ -1,4 +1,4 @@
-from sqlalchemy import create_all, create_engine, Column, Integer, String, Float, DateTime, Text, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 import datetime
@@ -19,6 +19,7 @@ class Property(Base):
     owner_mailing_address = Column(String)
     assessed_value = Column(Float)
     last_sale_date = Column(String)
+    property_class_code = Column(String)
 
 class Lead(Base):
     __tablename__ = "leads"
