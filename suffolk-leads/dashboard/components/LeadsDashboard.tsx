@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import type { Lead, LeadSource, LeadStatus } from "@/lib/types";
 import LeadSidePanel from "./LeadSidePanel";
 import ScoreBadge from "./ScoreBadge";
@@ -120,18 +121,39 @@ export default function LeadsDashboard() {
             <div style={{ fontSize: 11, color: "var(--muted)" }}>Real Estate Intelligence</div>
           </div>
         </div>
-        <div style={{ display: "flex", gap: 20 }}>
-          {[
-            { label: "Total", value: stats.total, color: "#3b82f6" },
-            { label: "New", value: stats.new, color: "#3b82f6" },
-            { label: "Contacted", value: stats.contacted, color: "#f59e0b" },
-            { label: "Qualified", value: stats.qualified, color: "#10b981" },
-          ].map((s) => (
-            <div key={s.label} style={{ textAlign: "center" }}>
-              <div style={{ fontSize: 18, fontWeight: 700, color: s.color }}>{s.value}</div>
-              <div style={{ fontSize: 11, color: "var(--muted)" }}>{s.label}</div>
-            </div>
-          ))}
+        <div style={{ display: "flex", alignItems: "center", gap: 24 }}>
+          <div style={{ display: "flex", gap: 20 }}>
+            {[
+              { label: "Total", value: stats.total, color: "#3b82f6" },
+              { label: "New", value: stats.new, color: "#3b82f6" },
+              { label: "Contacted", value: stats.contacted, color: "#f59e0b" },
+              { label: "Qualified", value: stats.qualified, color: "#10b981" },
+            ].map((s) => (
+              <div key={s.label} style={{ textAlign: "center" }}>
+                <div style={{ fontSize: 18, fontWeight: 700, color: s.color }}>{s.value}</div>
+                <div style={{ fontSize: 11, color: "var(--muted)" }}>{s.label}</div>
+              </div>
+            ))}
+          </div>
+          <nav style={{ display: "flex", gap: 4, borderLeft: "1px solid var(--border)", paddingLeft: 20 }}>
+            <Link href="/" style={{
+              padding: "6px 14px",
+              borderRadius: 8,
+              fontSize: 13,
+              fontWeight: 500,
+              color: "var(--accent)",
+              background: "rgba(59,130,246,0.12)",
+              textDecoration: "none",
+            }}>Leads</Link>
+            <Link href="/scoring" style={{
+              padding: "6px 14px",
+              borderRadius: 8,
+              fontSize: 13,
+              fontWeight: 500,
+              color: "var(--muted)",
+              textDecoration: "none",
+            }}>Scoring</Link>
+          </nav>
         </div>
       </header>
 
