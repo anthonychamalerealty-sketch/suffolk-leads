@@ -38,3 +38,8 @@ builder = "Nixpacks"
 startCommand = "python jobs/run_all.py"
 cronSchedule = "0 11 * * *"
 restartPolicyType = "never"
+
+# Ensure Python output is never buffered — critical for Railway log visibility
+[deploy.environmentVariables]
+PYTHONUNBUFFERED = "1"
+PYTHONDONTWRITEBYTECODE = "1"

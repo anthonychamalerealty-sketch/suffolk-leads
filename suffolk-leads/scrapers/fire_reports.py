@@ -41,13 +41,22 @@ import json
 import logging
 import datetime
 import re
-import requests
-from bs4 import BeautifulSoup
+try:
+    import requests
+    from bs4 import BeautifulSoup
+except ImportError as _e:
+    print(f"[fire_reports] IMPORT ERROR (requests/bs4): {_e} — install with: pip install requests beautifulsoup4", flush=True)
+    raise
 
 # Ensure project root is on sys.path so database imports work
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from database import SessionLocal, Property, Lead
+try:
+    from database import SessionLocal, Property, Lead
+except Exception as _e:
+    print(f"[fire_reports] IMPORT ERROR (database): {_e}", flush=True)
+    import traceback; traceback.print_exc()
+    raise
 from scrapers.base_scraper import BaseScraper
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")

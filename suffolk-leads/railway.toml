@@ -1,10 +1,18 @@
 # railway.toml — Main application service
 # ─────────────────────────────────────────────────────────────────────────────
-# This file configures the primary long-running service (API + scheduler).
+# This file configures the primary long-running service.
 #
-# For the daily digest cron job, see railway-cron.toml.
-# That file is used by a separate Railway service that runs
-# `python jobs/run_all.py` at 7:00 AM Eastern Time (11:00 AM UTC) daily.
+# Service behaviour is controlled by environment variables:
+#   RAILWAY_CRON_MODE=1  → run pipeline once and exit (cron mode)
+#   RUN_ONCE=1           → same as above
+#   (neither set)        → stay alive, run pipeline every hour (service mode)
+#
+# For the dedicated daily digest cron job, see railway-cron.toml.
+# That service uses startCommand = "python jobs/run_all.py" and runs at
+# 7:00 AM Eastern Time (11:00 AM UTC) every day.
+#
+# IMPORTANT: Set PYTHONUNBUFFERED=1 in the Railway service environment
+# variables dashboard so that print() output appears in logs immediately.
 # ─────────────────────────────────────────────────────────────────────────────
 
 [build]
@@ -12,3 +20,8 @@ builder = "Nixpacks"
 
 [deploy]
 startCommand = "python main.py"
+
+# Ensure Python output is never buffered — critical for Railway log visibility
+[deploy.environmentVariables]
+PYTHONUNBUFFERED = "1"
+PYTHONDONTWRITEBYTECODE = "1"

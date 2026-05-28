@@ -55,14 +55,23 @@ import sys
 import time
 from typing import Optional
 
-import requests
+try:
+    import requests
+except ImportError as _e:
+    print(f"[enrich] IMPORT ERROR (requests): {_e} — install with: pip install requests", flush=True)
+    raise
 
 # ---------------------------------------------------------------------------
 # Path setup — allow running as a script from any working directory
 # ---------------------------------------------------------------------------
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from database import Base, Contact, Lead, Property, SessionLocal, engine
+try:
+    from database import Base, Contact, Lead, Property, SessionLocal, engine
+except Exception as _e:
+    print(f"[enrich] IMPORT ERROR (database): {_e}", flush=True)
+    import traceback; traceback.print_exc()
+    raise
 from sqlalchemy import Column, String, text
 
 # ---------------------------------------------------------------------------

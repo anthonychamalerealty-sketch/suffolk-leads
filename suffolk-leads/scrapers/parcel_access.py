@@ -30,9 +30,20 @@ import time
 import re
 from datetime import datetime
 
-import requests
-from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
+try:
+    import requests
+    from bs4 import BeautifulSoup
+except ImportError as _e:
+    print(f"[parcel_access] IMPORT ERROR (requests/bs4): {_e} — install with: pip install requests beautifulsoup4", flush=True)
+    raise
+
+try:
+    from playwright.async_api import async_playwright
+    _PLAYWRIGHT_AVAILABLE = True
+except ImportError as _e:
+    print(f"[parcel_access] WARNING: playwright not installed — browser scraping disabled: {_e}", flush=True)
+    async_playwright = None
+    _PLAYWRIGHT_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Path setup so this module can be run directly or imported from the project root
@@ -42,7 +53,12 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from database import SessionLocal, Property, init_db
+try:
+    from database import SessionLocal, Property, init_db
+except Exception as _e:
+    print(f"[parcel_access] IMPORT ERROR (database): {_e}", flush=True)
+    import traceback; traceback.print_exc()
+    raise
 from scrapers.base_scraper import BaseScraper
 
 # ---------------------------------------------------------------------------
