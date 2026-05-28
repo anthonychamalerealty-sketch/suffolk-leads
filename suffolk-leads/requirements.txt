@@ -1,8 +1,36 @@
-Flask
-SQLAlchemy
-psycopg2-binary      # For PostgreSQL on Railway; sqlite3 is built-in for local dev
-python-dotenv
-requests
-beautifulsoup4
-playwright           # Tier 1b — USPhoneBook.com scraping (run: playwright install chromium)
-sendgrid             # Email delivery for jobs/daily_digest.py
+# ─────────────────────────────────────────────────────────────────────────────
+# Suffolk Leads — Python dependencies
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Web framework (main.py / API)
+Flask>=2.3,<4.0
+
+# ORM + database
+SQLAlchemy>=2.0,<3.0
+
+# PostgreSQL driver (used when DATABASE_URL points to Postgres on Railway)
+# psycopg2-binary is a self-contained wheel that does NOT require libpq-dev.
+psycopg2-binary>=2.9,<3.0
+
+# Environment variable loading from .env files
+python-dotenv>=1.0,<2.0
+
+# HTTP requests (all scrapers)
+requests>=2.31,<3.0
+
+# HTML parsing (all scrapers)
+beautifulsoup4>=4.12,<5.0
+lxml>=5.0,<6.0          # fast HTML/XML parser backend for BeautifulSoup
+
+# Email delivery (jobs/daily_digest.py)
+sendgrid>=6.11,<7.0
+
+# Browser automation (scrapers/parcel_access.py, processor/enrich.py)
+# NOTE: After deploying, run once:  playwright install chromium --with-deps
+playwright>=1.44,<2.0
+
+# Async HTTP (used by parcel_access.py Georgia scrapers)
+aiohttp>=3.9,<4.0
+
+# Testing
+pytest>=8.0,<9.0

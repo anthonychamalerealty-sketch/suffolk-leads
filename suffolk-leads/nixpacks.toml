@@ -1,0 +1,40 @@
+# nixpacks.toml
+# ─────────────────────────────────────────────────────────────────────────────
+# Nixpacks build configuration for the Railway cron service.
+# This ensures Playwright's Chromium browser is installed after pip packages.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[phases.setup]
+nixPkgs = [
+  "python311",
+  "gcc",
+  "glib",
+  "nss",
+  "nspr",
+  "dbus",
+  "atk",
+  "cups",
+  "libdrm",
+  "xorg.libX11",
+  "xorg.libXcomposite",
+  "xorg.libXdamage",
+  "xorg.libXext",
+  "xorg.libXfixes",
+  "xorg.libXrandr",
+  "mesa",
+  "expat",
+  "libxcb",
+  "xorg.libxkbcommon",
+  "pango",
+  "cairo",
+  "alsa-lib",
+]
+
+[phases.install]
+cmds = [
+  "pip install -r requirements.txt",
+  "playwright install chromium --with-deps || echo 'WARNING: playwright install failed — browser scraping will be skipped'",
+]
+
+[start]
+cmd = "python jobs/run_all.py"

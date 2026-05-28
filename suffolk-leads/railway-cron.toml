@@ -5,12 +5,24 @@
 # How to use:
 #   1. In your Railway project, click "+ New Service" → "GitHub Repo".
 #   2. Point it to the same suffolk-leads repository.
-#   3. In Service Settings → Source → "Config file path", enter:
-#        suffolk-leads/railway-cron.toml
+#   3. In Service Settings → Source → "Root Directory", enter:
+#        suffolk-leads
+#      (This ensures nixpacks.toml and requirements.txt are found correctly.)
 #   4. Set the following environment variables in the Railway service dashboard:
-#        DATABASE_URL       — shared PostgreSQL connection string
+#
+#      REQUIRED:
 #        SENDGRID_API_KEY   — your SendGrid API key
 #        DIGEST_EMAIL       — Anthonychamalerealty@gmail.com
+#
+#      DATABASE (choose one):
+#        Option A — PostgreSQL (recommended for production):
+#          DATABASE_URL = postgresql://user:pass@host:5432/dbname
+#        Option B — SQLite with a Railway persistent volume mounted at /data:
+#          DATABASE_PATH = /data/sql_app.db
+#        Option C — leave both unset and the script will create a fresh
+#          SQLite DB at /app/sql_app.db each run (leads won't persist
+#          between runs, but the digest email will still be sent).
+#
 #   5. Railway will run `python jobs/run_all.py` at 07:00 AM Eastern Time
 #      (11:00 AM UTC) every day.  The service exits when the script completes.
 #
