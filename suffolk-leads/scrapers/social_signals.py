@@ -1,14 +1,26 @@
 """
 scrapers/social_signals.py
 --------------------------
-Scrapes Craigslist Suffolk County housing/for-sale sections and Reddit r/longisland
-for posts containing specific motivated-seller keywords.
-Extracts street addresses from matching posts, cross-references them against
-the properties table, and inserts matches into the leads table with source='social_signal'.
+Scrapes Craigslist and Reddit for motivated-seller posts in both New York
+(Suffolk County / Long Island) and Georgia (Atlanta, Savannah, and Athens areas).
 
-Keywords:
+New York sources:
+  - Craigslist Long Island (longisland.craigslist.org) — housing (hhh) and for-sale (sss)
+  - Reddit r/longisland
+
+Georgia sources:
+  - Craigslist Atlanta (atlanta.craigslist.org) — housing (hhh) and for-sale (sss)
+  - Craigslist Savannah (savannah.craigslist.org) — housing (hhh) and for-sale (sss)
+  - Reddit r/Atlanta
+  - Reddit r/Athens
+
+Keywords monitored:
   'must sell', 'motivated seller', 'estate sale', 'as-is', 'cash only', 'divorce',
   'relocating', 'behind on payments', 'inherited', 'fixer upper', 'needs work'
+
+Extracts street addresses from matching posts, cross-references them against
+the properties table, and inserts matches into the leads table with
+source='social_signal' and the appropriate state/county tags.
 
 Rate limit: 1 request per 3 seconds.
 Usage:
@@ -57,10 +69,72 @@ STREET_SUFFIXES = (
 ADDRESS_REGEX = re.compile(
     r'\b(\d+)\s+([A-Za-z0-9\s\.\-\']+(?:' + STREET_SUFFIXES + r'))\b'
     r'(?:[\s,]+([A-Za-z\s\-\']+))?'
-    r'(?:[\s,]+(?:NY|New\s+York))?'
-    r'(?:[\s,]+(11[0-9]{3}))?\b',
+    r'(?:[\s,]+(?:NY|GA|New\s+York|Georgia))?'
+    r'(?:[\s,]+(\d{5}))?\b',
     re.IGNORECASE
 )
+
+# ---------------------------------------------------------------------------
+# Craigslist site configurations
+# ---------------------------------------------------------------------------
+CRAIGSLIST_SITES = [
+    {
+        "name": "Craigslist Long Island (NY)",
+        "base_url": "https://longisland.craigslist.org",
+        "state": "NY",
+        "county": "Suffolk",
+    },
+    {
+        "name": "Craigslist Atlanta (GA)",
+        "base_url": "https://atlanta.craigslist.org",
+        "state": "GA",
+        "county": "",  # county resolved from address
+    },
+    {
+        "name": "Craigslist Savannah (GA)",
+        "base_url": "https://savannah.craigslist.org",
+        "state": "GA",
+        "county": "Chatham",  # Savannah is primarily Chatham County
+    },
+]
+
+# ---------------------------------------------------------------------------
+# Reddit subreddit configurations
+# ---------------------------------------------------------------------------
+REDDIT_SUBREDDITS = [
+    {
+        "name": "r/longisland",
+        "subreddit": "longisland",
+        "state": "NY",
+        "county": "Suffolk",
+    },
+    {
+        "name": "r/Atlanta",
+        "subreddit": "Atlanta",
+        "state": "GA",
+        "county": "",  # county resolved from address
+    },
+    {
+        "name": "r/Athens",
+        "subreddit": "Athens",
+        "state": "GA",
+        "county": "Clarke",
+    },
+]
+
+# Georgia city-to-county mapping for resolving county from address
+GA_CITY_COUNTY: dict[str, str] = {
+    "atlanta": "Fulton", "sandy springs": "Fulton", "roswell": "Fulton",
+    "alpharetta": "Fulton", "johns creek": "Fulton", "east point": "Fulton",
+    "lawrenceville": "Gwinnett", "duluth": "Gwinnett", "norcross": "Gwinnett",
+    "suwanee": "Gwinnett", "buford": "Gwinnett", "snellville": "Gwinnett",
+    "marietta": "Cobb", "smyrna": "Cobb", "kennesaw": "Cobb",
+    "acworth": "Cobb", "powder springs": "Cobb",
+    "decatur": "DeKalb", "tucker": "DeKalb", "chamblee": "DeKalb",
+    "doraville": "DeKalb", "lithonia": "DeKalb",
+    "savannah": "Chatham", "pooler": "Chatham", "garden city": "Chatham",
+    "athens": "Clarke", "winterville": "Clarke",
+}
 
 class SocialSignalsScraper(BaseScraper):
     """
@@ -83,29 +157,41 @@ class SocialSignalsScraper(BaseScraper):
 
     def scrape(self):
         """
-        Main entry point. Performs scraping of Craigslist and Reddit,
-        extracts potential leads, and persists them to the database.
+        Main entry point. Performs scraping of Craigslist (Long Island, Atlanta,
+        Savannah) and Reddit (r/longisland, r/Atlanta, r/Athens), extracts
+        potential leads, and persists them to the database with state/county tags.
         """
-        logger.info("Starting Social Signals Scraper...")
+        logger.info("Starting Social Signals Scraper (NY + GA)...")
         posts = []
 
-        # 1. Scrape Craigslist
-        cl_posts = self._scrape_craigslist()
-        posts.extend(cl_posts)
-        logger.info(f"Found {len(cl_posts)} relevant posts from Craigslist.")
+        # 1. Scrape all Craigslist sites
+        for site in CRAIGSLIST_SITES:
+            logger.info("Scraping %s...", site["name"])
+            cl_posts = self._scrape_craigslist_site(
+                site["base_url"],
+                state=site["state"],
+                county=site["county"],
+            )
+            posts.extend(cl_posts)
+            logger.info("Found %d relevant posts from %s.", len(cl_posts), site["name"])
+            time.sleep(3)
 
-        # Rate limit between sources
-        time.sleep(3)
-
-        # 2. Scrape Reddit
-        reddit_posts = self._scrape_reddit()
-        posts.extend(reddit_posts)
-        logger.info(f"Found {len(reddit_posts)} relevant posts from Reddit r/longisland.")
+        # 2. Scrape all Reddit subreddits
+        for sub_cfg in REDDIT_SUBREDDITS:
+            logger.info("Scraping %s...", sub_cfg["name"])
+            reddit_posts = self._scrape_reddit_subreddit(
+                sub_cfg["subreddit"],
+                state=sub_cfg["state"],
+                county=sub_cfg["county"],
+            )
+            posts.extend(reddit_posts)
+            logger.info("Found %d relevant posts from %s.", len(reddit_posts), sub_cfg["name"])
+            time.sleep(3)
 
         # 3. Process posts & cross-reference with database properties
         if posts:
             saved_count = self._save_leads(posts)
-            logger.info(f"Successfully processed posts and saved {saved_count} new leads.")
+            logger.info("Successfully processed posts and saved %d new leads.", saved_count)
             return posts
         else:
             logger.info("No matching social signal posts found today.")
@@ -114,87 +200,109 @@ class SocialSignalsScraper(BaseScraper):
     # ------------------------------------------------------------------
     # Craigslist Scraper
     # ------------------------------------------------------------------
-    def _scrape_craigslist(self) -> list[dict]:
+    def _scrape_craigslist_site(
+        self,
+        base_url: str,
+        state: str = "NY",
+        county: str = "Suffolk",
+    ) -> list[dict]:
         """
-        Scrapes Craigslist Suffolk County housing and for-sale sections.
-        Since Craigslist has an 'OR' operator '|', we can query multiple keywords.
+        Scrapes a single Craigslist site's housing (hhh) and for-sale (sss)
+        sections for motivated-seller keyword matches.
+
+        Parameters
+        ----------
+        base_url : Craigslist regional base URL (e.g. https://atlanta.craigslist.org)
+        state    : Two-letter state code for tagging records
+        county   : County name for tagging records (empty string = resolve from address)
         """
         results = []
-        # We check housing (hhh) and for-sale (sss) sections
         sections = ['hhh', 'sss']
-        
-        # Build query with OR operator: e.g. "must sell" | "motivated seller" | ...
         query = " | ".join(f'"{kw}"' for kw in KEYWORDS)
 
         for sec in sections:
-            url = f"https://longisland.craigslist.org/search/{sec}"
+            url = f"{base_url}/search/{sec}"
             params = {"query": query}
-            
-            logger.info(f"Scraping Craigslist section '{sec}' with query: {query[:50]}...")
+            logger.info("Scraping Craigslist section '%s' at %s...", sec, base_url)
             try:
-                res = self.session.get(url, params=params)
+                res = self.session.get(url, params=params, timeout=12)
                 if res.status_code != 200:
-                    logger.error(f"Failed to fetch Craigslist section '{sec}': Status {res.status_code}")
+                    logger.error("Failed to fetch Craigslist section '%s': Status %d", sec, res.status_code)
                     continue
 
                 soup = BeautifulSoup(res.text, "html.parser")
-                
-                # Parse static search results
                 items = soup.find_all(class_="cl-static-search-result")
                 for item in items:
                     anchor = item.find("a")
                     if not anchor:
                         continue
-                    
                     post_url = anchor.get("href", "")
                     title_div = item.find(class_="title")
                     title = title_div.text.strip() if title_div else ""
-                    
-                    # Optional details
                     price_div = item.find(class_="price")
                     price = price_div.text.strip() if price_div else ""
                     loc_div = item.find(class_="location")
                     location = loc_div.text.strip() if loc_div else ""
 
-                    # For Craigslist static results, the text is usually just the title.
-                    # We will use title as the text for matching/extraction.
+                    # Resolve county from location text for GA records
+                    resolved_county = county
+                    if state == "GA" and not county:
+                        resolved_county = self._ga_county_from_text(location or title)
+
                     results.append({
                         "source": "craigslist",
                         "title": title,
                         "text": f"{title} (Location: {location}, Price: {price})",
                         "url": post_url,
-                        "date": datetime.date.today().isoformat()
+                        "date": datetime.date.today().isoformat(),
+                        "state": state,
+                        "county": resolved_county,
                     })
 
             except Exception as e:
-                logger.error(f"Error scraping Craigslist section '{sec}': {e}")
-            
-            # Rate limit requests
+                logger.error("Error scraping Craigslist section '%s': %s", sec, e)
             time.sleep(3)
 
         return results
 
+    # Keep backward-compatible alias
+    def _scrape_craigslist(self) -> list[dict]:
+        """Backward-compatible wrapper — scrapes Long Island Craigslist only."""
+        return self._scrape_craigslist_site(
+            "https://longisland.craigslist.org", state="NY", county="Suffolk"
+        )
+
     # ------------------------------------------------------------------
     # Reddit Scraper
     # ------------------------------------------------------------------
-    def _scrape_reddit(self) -> list[dict]:
+    def _scrape_reddit_subreddit(
+        self,
+        subreddit: str,
+        state: str = "NY",
+        county: str = "Suffolk",
+    ) -> list[dict]:
         """
-        Scrapes Reddit r/longisland for the same keyword list using pullpush.io API.
+        Scrapes a Reddit subreddit for the keyword list using the pullpush.io API.
+
+        Parameters
+        ----------
+        subreddit : Subreddit name (e.g. 'longisland', 'Atlanta', 'Athens')
+        state     : Two-letter state code for tagging records
+        county    : County name for tagging records (empty string = resolve from text)
         """
         results = []
-        logger.info("Scraping Reddit r/longisland via pullpush.io...")
+        logger.info("Scraping Reddit r/%s via pullpush.io...", subreddit)
 
         for kw in KEYWORDS:
             url = "https://api.pullpush.io/reddit/search/submission/"
-            params = {
-                "q": kw,
-                "subreddit": "longisland",
-                "size": 10
-            }
+            params = {"q": kw, "subreddit": subreddit, "size": 10}
             try:
-                res = self.session.get(url, params=params)
+                res = self.session.get(url, params=params, timeout=12)
                 if res.status_code != 200:
-                    logger.error(f"Failed to fetch Reddit search for keyword '{kw}': Status {res.status_code}")
+                    logger.error(
+                        "Failed to fetch Reddit r/%s for keyword '%s': Status %d",
+                        subreddit, kw, res.status_code,
+                    )
                     continue
 
                 data = res.json()
@@ -204,25 +312,50 @@ class SocialSignalsScraper(BaseScraper):
                     selftext = sub.get("selftext", "")
                     permalink = sub.get("permalink", "")
                     post_url = f"https://reddit.com{permalink}" if permalink else ""
-                    
-                    # Combine title and body for complete post text
                     combined_text = f"{title}\n\n{selftext}"
-                    
+
+                    # Resolve county from post text for GA records
+                    resolved_county = county
+                    if state == "GA" and not county:
+                        resolved_county = self._ga_county_from_text(combined_text)
+
                     results.append({
                         "source": "reddit",
                         "title": title,
                         "text": combined_text,
                         "url": post_url,
-                        "date": datetime.date.today().isoformat()
+                        "date": datetime.date.today().isoformat(),
+                        "state": state,
+                        "county": resolved_county,
                     })
 
             except Exception as e:
-                logger.error(f"Error scraping Reddit for keyword '{kw}': {e}")
-            
-            # Rate limit requests
+                logger.error("Error scraping Reddit r/%s for keyword '%s': %s", subreddit, kw, e)
             time.sleep(3)
 
         return results
+
+    # Keep backward-compatible alias
+    def _scrape_reddit(self) -> list[dict]:
+        """Backward-compatible wrapper — scrapes r/longisland only."""
+        return self._scrape_reddit_subreddit("longisland", state="NY", county="Suffolk")
+
+    # ------------------------------------------------------------------
+    # Georgia county resolution helper
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _ga_county_from_text(text: str) -> str:
+        """
+        Attempts to derive a Georgia county from free-form text by matching
+        known city names.  Returns an empty string if no match is found.
+        """
+        if not text:
+            return ""
+        lower = text.lower()
+        for city, county in GA_CITY_COUNTY.items():
+            if city in lower:
+                return county
+        return ""
 
     # ------------------------------------------------------------------
     # Address Extraction & Matching
@@ -354,6 +487,8 @@ class SocialSignalsScraper(BaseScraper):
                         raw_data=json.dumps(raw_data),
                         score=0.80,  # Highly motivated signal
                         status="new",
+                        state=post.get("state", getattr(prop, "state", "NY")),
+                        county=post.get("county", getattr(prop, "county", "Suffolk")),
                     )
                     session.add(lead)
                     saved_count += 1

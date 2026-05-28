@@ -20,6 +20,8 @@ class Property(Base):
     assessed_value = Column(Float)
     last_sale_date = Column(String)
     property_class_code = Column(String)
+    state = Column(String, default="NY")
+    county = Column(String, default="Suffolk")
 
 class Lead(Base):
     __tablename__ = "leads"
@@ -31,6 +33,8 @@ class Lead(Base):
     score = Column(Float)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     status = Column(String, default="new")
+    state = Column(String, default="NY")
+    county = Column(String, default="Suffolk")
 
 class Contact(Base):
     __tablename__ = "contacts"

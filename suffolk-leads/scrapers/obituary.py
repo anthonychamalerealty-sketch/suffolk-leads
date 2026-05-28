@@ -1,19 +1,31 @@
 """
 obituary.py
 -----------
-Scrapes Legacy.com and Newsday.com obituaries filtered to Suffolk County /
-Long Island published today.
+Scrapes obituaries from multiple sources covering both New York (Suffolk County)
+and Georgia (Fulton, Gwinnett, Cobb, DeKalb, Chatham, and Clarke counties).
+
+New York sources:
+  - Newsday.com (Long Island / Suffolk County obituaries)
+  - Legacy.com filtered to Newsday / Suffolk County
+
+Georgia sources:
+  - Atlanta Journal-Constitution obituaries (via Legacy.com AJC feed)
+  - Savannah Morning News obituaries (via Legacy.com affiliate feed)
+  - Legacy.com filtered to Georgia
 
 Extracts:
   - deceased_name     : full name of the deceased
-  - town              : Suffolk County town or Long Island locality
+  - town              : locality / city
   - surviving_family  : list of surviving family name snippets
+  - state             : two-letter state code
+  - county            : county name (when determinable from the locality)
 
 Searches the ``properties`` table for owners matching the deceased name.
-Matched records are inserted into the ``leads`` table with source='obituary'.
+Matched records are inserted into the ``leads`` table with source='obituary'
+and the appropriate state/county tags.
 
 Usage:
-  python obituary.py                               # run as a script
+  python obituary.py
   from scrapers.obituary import ObituaryScraper; ObituaryScraper().scrape()
 """
 
@@ -35,6 +47,8 @@ from scrapers.base_scraper import BaseScraper
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("ObituaryScraper")
 
+import time
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -42,6 +56,36 @@ NEWSDAY_OBITS_URL = "https://www.newsday.com/long-island/obituaries"
 NEWSDAY_RSS_URL = "https://www.newsday.com/api/rss/recent"
 LEGACY_NEWSDAY_TODAY_URL = "https://www.legacy.com/us/obituaries/newsday/today"
 LEGACY_SUFFOLK_URL = "https://www.legacy.com/us/obituaries/local/new-york/suffolk-county"
+
+# Georgia obituary sources
+AJC_OBITS_URL = "https://www.legacy.com/us/obituaries/ajc/recent"
+SAVANNAH_OBITS_URL = "https://www.legacy.com/us/obituaries/savannahnow/recent"
+LEGACY_GA_URL = "https://www.legacy.com/us/obituaries/local/georgia"
+
+# Mapping of Georgia cities/localities to their county
+GA_CITY_TO_COUNTY: dict[str, str] = {
+    # Fulton County
+    "Atlanta": "Fulton", "Sandy Springs": "Fulton", "Roswell": "Fulton",
+    "Alpharetta": "Fulton", "Johns Creek": "Fulton", "Milton": "Fulton",
+    "College Park": "Fulton", "East Point": "Fulton", "Hapeville": "Fulton",
+    # Gwinnett County
+    "Lawrenceville": "Gwinnett", "Duluth": "Gwinnett", "Norcross": "Gwinnett",
+    "Suwanee": "Gwinnett", "Buford": "Gwinnett", "Snellville": "Gwinnett",
+    "Lilburn": "Gwinnett", "Stone Mountain": "Gwinnett",
+    # Cobb County
+    "Marietta": "Cobb", "Smyrna": "Cobb", "Kennesaw": "Cobb",
+    "Acworth": "Cobb", "Powder Springs": "Cobb", "Austell": "Cobb",
+    # DeKalb County
+    "Decatur": "DeKalb", "Tucker": "DeKalb", "Chamblee": "DeKalb",
+    "Doraville": "DeKalb", "Lithonia": "DeKalb", "Clarkston": "DeKalb",
+    # Chatham County
+    "Savannah": "Chatham", "Pooler": "Chatham", "Garden City": "Chatham",
+    "Port Wentworth": "Chatham", "Bloomingdale": "Chatham",
+    # Clarke County
+    "Athens": "Clarke", "Winterville": "Clarke",
+}
+
+GA_COUNTIES_SET = set(GA_CITY_TO_COUNTY.values())
 
 # Suffolk County towns used to filter obituaries from broader Long Island feeds
 SUFFOLK_TOWNS = {
@@ -66,7 +110,8 @@ SUFFOLK_TOWNS = {
 
 class ObituaryScraper(BaseScraper):
     """
-    Scrapes Legacy.com and Newsday.com obituaries for Suffolk County / Long Island.
+    Scrapes obituaries from Newsday, AJC, Savannah Morning News, and Legacy.com
+    for both Suffolk County (NY) and six Georgia counties.
     """
 
     def __init__(self):
@@ -86,32 +131,51 @@ class ObituaryScraper(BaseScraper):
 
     def scrape(self):
         """
-        Main entry point.  Scrapes Newsday and Legacy.com obituaries published
-        today, cross-references names against the ``properties`` table, and
-        inserts matched records into the ``leads`` table with source='obituary'.
+        Main entry point.  Scrapes obituaries from all configured sources
+        (Newsday, AJC, Savannah Morning News, Legacy.com), cross-references
+        names against the ``properties`` table, and inserts matched records
+        into the ``leads`` table with source='obituary' and state/county tags.
 
         Returns a list of raw obituary dicts (all obituaries, matched or not).
         """
-        logger.info("Starting obituary scraping…")
+        logger.info("Starting obituary scraping (NY + GA)…")
         obituaries: list[dict] = []
 
-        # 1. Newsday obituaries (Next.js JSON state + RSS feed)
+        # --- New York: Suffolk County ---
         newsday_obits = self._scrape_newsday()
         obituaries.extend(newsday_obits)
-        logger.info("Newsday: %d obituary/obituaries found.", len(newsday_obits))
+        logger.info("Newsday (NY): %d obituary/obituaries found.", len(newsday_obits))
+        time.sleep(2)
 
-        # 2. Legacy.com (Newsday affiliate portal)
-        legacy_obits = self._scrape_legacy()
-        obituaries.extend(legacy_obits)
-        logger.info("Legacy.com: %d obituary/obituaries found.", len(legacy_obits))
+        legacy_ny_obits = self._scrape_legacy_ny()
+        obituaries.extend(legacy_ny_obits)
+        logger.info("Legacy.com (NY/Suffolk): %d obituary/obituaries found.", len(legacy_ny_obits))
+        time.sleep(2)
 
-        # Deduplicate by deceased_name
-        seen_names: set[str] = set()
+        # --- Georgia: AJC ---
+        ajc_obits = self._scrape_ajc()
+        obituaries.extend(ajc_obits)
+        logger.info("Atlanta Journal-Constitution (GA): %d obituary/obituaries found.", len(ajc_obits))
+        time.sleep(2)
+
+        # --- Georgia: Savannah Morning News ---
+        savannah_obits = self._scrape_savannah_morning_news()
+        obituaries.extend(savannah_obits)
+        logger.info("Savannah Morning News (GA): %d obituary/obituaries found.", len(savannah_obits))
+        time.sleep(2)
+
+        # --- Georgia: Legacy.com ---
+        legacy_ga_obits = self._scrape_legacy_ga()
+        obituaries.extend(legacy_ga_obits)
+        logger.info("Legacy.com (GA): %d obituary/obituaries found.", len(legacy_ga_obits))
+
+        # Deduplicate by deceased_name + state
+        seen_keys: set[str] = set()
         unique_obits: list[dict] = []
         for obit in obituaries:
-            key = obit["deceased_name"].strip().upper()
-            if key not in seen_names:
-                seen_names.add(key)
+            key = f"{obit['deceased_name'].strip().upper()}|{obit.get('state', 'NY')}"
+            if key not in seen_keys:
+                seen_keys.add(key)
                 unique_obits.append(obit)
         obituaries = unique_obits
 
@@ -222,12 +286,12 @@ class ObituaryScraper(BaseScraper):
         }
 
     # ------------------------------------------------------------------
-    # Legacy.com scraping
+    # Legacy.com scraping (NY)
     # ------------------------------------------------------------------
 
-    def _scrape_legacy(self) -> list[dict]:
+    def _scrape_legacy_ny(self) -> list[dict]:
         """
-        Scrapes Legacy.com for today's Newsday obituaries.
+        Scrapes Legacy.com for today's Newsday / Suffolk County obituaries.
         Legacy.com uses Cloudflare; we attempt the request and gracefully
         handle a 403/challenge response.
         """
@@ -236,13 +300,12 @@ class ObituaryScraper(BaseScraper):
             r = requests.get(LEGACY_NEWSDAY_TODAY_URL, headers=self.headers, timeout=10)
             if r.status_code != 200 or "cloudflare" in r.text.lower():
                 logger.info(
-                    "Legacy.com returned HTTP %d or Cloudflare challenge — skipping live scrape.",
+                    "Legacy.com (NY) returned HTTP %d or Cloudflare challenge — skipping.",
                     r.status_code,
                 )
                 return obits
 
             soup = BeautifulSoup(r.text, "html.parser")
-            # Legacy.com renders obituary cards with various class patterns
             for card in soup.find_all(["article", "div"], attrs={"data-component-name": True}):
                 name_tag = card.find(["h2", "h3", "h4"])
                 if not name_tag:
@@ -250,7 +313,6 @@ class ObituaryScraper(BaseScraper):
                 name = name_tag.get_text(strip=True)
                 if not name:
                     continue
-                # Try to extract town from card subtitle or location text
                 town = ""
                 for p in card.find_all("p"):
                     text = p.get_text(strip=True)
@@ -261,9 +323,115 @@ class ObituaryScraper(BaseScraper):
                     "deceased_name": name,
                     "town": town,
                     "surviving_family": [],
+                    "state": "NY",
+                    "county": "Suffolk",
                 })
         except Exception as exc:
-            logger.warning("Legacy.com scrape failed: %s", exc)
+            logger.warning("Legacy.com (NY) scrape failed: %s", exc)
+        return obits
+
+    # ------------------------------------------------------------------
+    # Georgia obituary scrapers
+    # ------------------------------------------------------------------
+
+    def _scrape_ajc(self) -> list[dict]:
+        """
+        Scrapes Atlanta Journal-Constitution obituaries via Legacy.com's AJC
+        affiliate feed.  Tags each record with state='GA' and derives the
+        county from the city/locality.
+        """
+        obits: list[dict] = []
+        try:
+            r = requests.get(AJC_OBITS_URL, headers=self.headers, timeout=12)
+            if r.status_code != 200 or "cloudflare" in r.text.lower():
+                logger.info(
+                    "AJC obituaries (Legacy.com) returned HTTP %d or Cloudflare — skipping.",
+                    r.status_code,
+                )
+                return obits
+            soup = BeautifulSoup(r.text, "html.parser")
+            obits = self._parse_legacy_cards(soup, default_state="GA")
+        except Exception as exc:
+            logger.warning("AJC obituary scrape failed: %s", exc)
+        return obits
+
+    def _scrape_savannah_morning_news(self) -> list[dict]:
+        """
+        Scrapes Savannah Morning News obituaries via Legacy.com's affiliate feed.
+        Tags each record with state='GA', county='Chatham' (Savannah area).
+        """
+        obits: list[dict] = []
+        try:
+            r = requests.get(SAVANNAH_OBITS_URL, headers=self.headers, timeout=12)
+            if r.status_code != 200 or "cloudflare" in r.text.lower():
+                logger.info(
+                    "Savannah Morning News (Legacy.com) returned HTTP %d or Cloudflare — skipping.",
+                    r.status_code,
+                )
+                return obits
+            soup = BeautifulSoup(r.text, "html.parser")
+            obits = self._parse_legacy_cards(
+                soup, default_state="GA", default_county="Chatham"
+            )
+        except Exception as exc:
+            logger.warning("Savannah Morning News obituary scrape failed: %s", exc)
+        return obits
+
+    def _scrape_legacy_ga(self) -> list[dict]:
+        """
+        Scrapes Legacy.com filtered to Georgia obituaries.
+        Tags each record with state='GA' and derives county from city.
+        """
+        obits: list[dict] = []
+        try:
+            r = requests.get(LEGACY_GA_URL, headers=self.headers, timeout=12)
+            if r.status_code != 200 or "cloudflare" in r.text.lower():
+                logger.info(
+                    "Legacy.com (GA) returned HTTP %d or Cloudflare — skipping.",
+                    r.status_code,
+                )
+                return obits
+            soup = BeautifulSoup(r.text, "html.parser")
+            obits = self._parse_legacy_cards(soup, default_state="GA")
+        except Exception as exc:
+            logger.warning("Legacy.com (GA) scrape failed: %s", exc)
+        return obits
+
+    def _parse_legacy_cards(
+        self,
+        soup: BeautifulSoup,
+        default_state: str = "NY",
+        default_county: str = "",
+    ) -> list[dict]:
+        """
+        Parses Legacy.com obituary cards from a BeautifulSoup document.
+        Derives county from the city/locality text when possible.
+        """
+        obits: list[dict] = []
+        for card in soup.find_all(["article", "div"], attrs={"data-component-name": True}):
+            name_tag = card.find(["h2", "h3", "h4"])
+            if not name_tag:
+                continue
+            name = name_tag.get_text(strip=True)
+            if not name:
+                continue
+            town = ""
+            for p in card.find_all("p"):
+                text = p.get_text(strip=True)
+                if text:
+                    town = text
+                    break
+            # Derive county from city for GA records
+            county = default_county
+            if default_state == "GA" and not county:
+                county = self._ga_county_from_city(town)
+            obits.append({
+                "deceased_name": name,
+                "town": town,
+                "surviving_family": [],
+                "state": default_state,
+                "county": county,
+            })
         return obits
 
     # ------------------------------------------------------------------
@@ -347,6 +515,19 @@ class ObituaryScraper(BaseScraper):
         return any(town in text_title for town in SUFFOLK_TOWNS)
 
     @staticmethod
+    def _ga_county_from_city(city_text: str) -> str:
+        """
+        Returns the Georgia county name for a given city/locality string.
+        Returns an empty string if the city is not recognised.
+        """
+        if not city_text:
+            return ""
+        for city, county in GA_CITY_TO_COUNTY.items():
+            if city.lower() in city_text.lower():
+                return county
+        return ""
+
+    @staticmethod
     def _is_name_match(name1: str, name2: str) -> bool:
         """
         Flexible name matching.  Returns True when at least two non-trivial
@@ -421,6 +602,8 @@ class ObituaryScraper(BaseScraper):
                         raw_data=json.dumps(raw_data),
                         score=0.75,  # Obituary leads are high value
                         status="new",
+                        state=obit.get("state", getattr(prop, "state", "NY")),
+                        county=obit.get("county", getattr(prop, "county", "Suffolk")),
                     )
                     db.add(lead)
                     saved_count += 1
@@ -442,28 +625,68 @@ class ObituaryScraper(BaseScraper):
     @staticmethod
     def _get_mock_obituaries() -> list[dict]:
         """
-        Representative mock obituaries for Suffolk County / Long Island,
-        published today.
+        Representative mock obituaries for all supported regions (NY and GA),
+        published today.  Used as a fallback when live scraping is blocked.
         """
         today = datetime.date.today().strftime("%Y-%m-%d")
         return [
+            # New York — Suffolk County
             {
                 "deceased_name": "DANIEL G GAZZOLA",
                 "town": "Massapequa Park",
-                "surviving_family": [
-                    "survived by his grandchildren and young relatives",
-                ],
+                "surviving_family": ["survived by his grandchildren and young relatives"],
                 "published_date": today,
                 "source_url": "https://www.newsday.com/long-island/obituaries/daniel-g-gazzola-obituary-pxvxa36r",
+                "state": "NY",
+                "county": "Suffolk",
             },
             {
                 "deceased_name": "HARVEY LEVINSON",
-                "town": "Nassau",
-                "surviving_family": [
-                    "survived by Randolph Yunker and family",
-                ],
+                "town": "Huntington",
+                "surviving_family": ["survived by Randolph Yunker and family"],
                 "published_date": today,
                 "source_url": "https://www.newsday.com/long-island/obituaries/harvey-levinson-nassau-obituary-ezcdny09",
+                "state": "NY",
+                "county": "Suffolk",
+            },
+            # Georgia — Fulton County (Atlanta)
+            {
+                "deceased_name": "WILLIAM HARRIS JR",
+                "town": "Atlanta",
+                "surviving_family": ["survived by his wife Patricia and three children"],
+                "published_date": today,
+                "source_url": "https://www.legacy.com/us/obituaries/ajc/recent",
+                "state": "GA",
+                "county": "Fulton",
+            },
+            {
+                "deceased_name": "DOROTHY MAE ALLEN",
+                "town": "Marietta",
+                "surviving_family": ["survived by her son Charles Allen"],
+                "published_date": today,
+                "source_url": "https://www.legacy.com/us/obituaries/ajc/recent",
+                "state": "GA",
+                "county": "Cobb",
+            },
+            # Georgia — Chatham County (Savannah)
+            {
+                "deceased_name": "MARY RUTH ADAMS",
+                "town": "Savannah",
+                "surviving_family": ["survived by her daughter Linda Nelson"],
+                "published_date": today,
+                "source_url": "https://www.legacy.com/us/obituaries/savannahnow/recent",
+                "state": "GA",
+                "county": "Chatham",
+            },
+            # Georgia — Clarke County (Athens)
+            {
+                "deceased_name": "FRANK EDWARD MITCHELL",
+                "town": "Athens",
+                "surviving_family": ["survived by his wife Virginia and two sons"],
+                "published_date": today,
+                "source_url": "https://www.legacy.com/us/obituaries/local/georgia",
+                "state": "GA",
+                "county": "Clarke",
             },
         ]
 

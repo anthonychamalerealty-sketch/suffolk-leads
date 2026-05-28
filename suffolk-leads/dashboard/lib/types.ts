@@ -10,6 +10,9 @@ export interface Lead {
   status: LeadStatus;
   raw_data: string;
   parcel_id: string;
+  // location tags
+  state: string | null;
+  county: string | null;
   // joined from contacts
   owner_name: string | null;
   phone: string | null;

@@ -162,6 +162,19 @@ export default function LeadSidePanel({ lead, onClose, onStatusChange }: Props) 
         {/* Property Info */}
         <Section title="Property Details">
           <InfoRow label="Parcel ID" value={lead.parcel_id} />
+          <InfoRow label="State" value={
+            lead.state ? (
+              <span style={{
+                display: "inline-flex", alignItems: "center", gap: 4,
+                padding: "2px 8px", borderRadius: 12, fontSize: 12, fontWeight: 600,
+                background: lead.state === "GA" ? "rgba(16,185,129,0.12)" : "rgba(59,130,246,0.12)",
+                color: lead.state === "GA" ? "#10b981" : "#3b82f6",
+              }}>
+                {lead.state === "GA" ? "🍑" : "🗽"} {lead.state === "GA" ? "Georgia" : "New York"}
+              </span>
+            ) : null
+          } />
+          <InfoRow label="County" value={lead.county} />
           <InfoRow label="Assessed Value" value={
             lead.assessed_value
               ? `$${lead.assessed_value.toLocaleString("en-US")}`

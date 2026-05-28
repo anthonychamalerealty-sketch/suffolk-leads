@@ -16,11 +16,36 @@ const SOURCES: { key: LeadSource | "all"; label: string }[] = [
   { key: "social", label: "📱 Social" },
 ];
 
+const STATES: { key: string; label: string }[] = [
+  { key: "", label: "All States" },
+  { key: "NY", label: "🗽 New York" },
+  { key: "GA", label: "🍑 Georgia" },
+];
+
+const COUNTIES_BY_STATE: Record<string, { key: string; label: string }[]> = {
+  "": [],
+  NY: [
+    { key: "", label: "All Counties" },
+    { key: "Suffolk", label: "Suffolk" },
+  ],
+  GA: [
+    { key: "", label: "All Counties" },
+    { key: "Fulton", label: "Fulton" },
+    { key: "Gwinnett", label: "Gwinnett" },
+    { key: "Cobb", label: "Cobb" },
+    { key: "DeKalb", label: "DeKalb" },
+    { key: "Chatham", label: "Chatham" },
+    { key: "Clarke", label: "Clarke" },
+  ],
+};
+
 export default function LeadsDashboard() {
   const [leads, setLeads] = useState<Lead[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [source, setSource] = useState<LeadSource | "all">("all");
+  const [stateFilter, setStateFilter] = useState("");
+  const [countyFilter, setCountyFilter] = useState("");
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
@@ -41,6 +66,8 @@ export default function LeadsDashboard() {
       const params = new URLSearchParams();
       if (source !== "all") params.set("source", source);
       if (debouncedSearch) params.set("search", debouncedSearch);
+      if (stateFilter) params.set("state", stateFilter);
+      if (countyFilter) params.set("county", countyFilter);
       const res = await fetch(`/api/leads?${params.toString()}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
@@ -50,7 +77,7 @@ export default function LeadsDashboard() {
     } finally {
       setLoading(false);
     }
-  }, [source, debouncedSearch]);
+  }, [source, debouncedSearch, stateFilter, countyFilter]);
 
   useEffect(() => { fetchLeads(); }, [fetchLeads]);
 
@@ -60,12 +87,14 @@ export default function LeadsDashboard() {
       const params = new URLSearchParams();
       if (source !== "all") params.set("source", source);
       if (debouncedSearch) params.set("search", debouncedSearch);
+      if (stateFilter) params.set("state", stateFilter);
+      if (countyFilter) params.set("county", countyFilter);
       const res = await fetch(`/api/leads/export?${params.toString()}`);
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `suffolk-leads-${new Date().toISOString().slice(0, 10)}.csv`;
+      a.download = `leads-${stateFilter || "all"}-${new Date().toISOString().slice(0, 10)}.csv`;
       a.click();
       URL.revokeObjectURL(url);
     } finally {
@@ -168,7 +197,7 @@ export default function LeadsDashboard() {
         flexWrap: "wrap",
       }}>
         {/* Source filters */}
-        <div style={{ display: "flex", gap: 6 }}>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
           {SOURCES.map((s) => (
             <button
               key={s.key}
@@ -190,6 +219,48 @@ export default function LeadsDashboard() {
             </button>
           ))}
         </div>
+
+        {/* State filter */}
+        <select
+          value={stateFilter}
+          onChange={(e) => { setStateFilter(e.target.value); setCountyFilter(""); }}
+          style={{
+            padding: "7px 10px",
+            background: "var(--surface2)",
+            border: "1px solid var(--border)",
+            borderRadius: 8,
+            color: stateFilter ? "var(--text)" : "var(--muted)",
+            fontSize: 13,
+            cursor: "pointer",
+            outline: "none",
+          }}
+        >
+          {STATES.map((s) => (
+            <option key={s.key} value={s.key}>{s.label}</option>
+          ))}
+        </select>
+
+        {/* County filter — only shown when a state is selected */}
+        {stateFilter && COUNTIES_BY_STATE[stateFilter]?.length > 0 && (
+          <select
+            value={countyFilter}
+            onChange={(e) => setCountyFilter(e.target.value)}
+            style={{
+              padding: "7px 10px",
+              background: "var(--surface2)",
+              border: "1px solid var(--border)",
+              borderRadius: 8,
+              color: countyFilter ? "var(--text)" : "var(--muted)",
+              fontSize: 13,
+              cursor: "pointer",
+              outline: "none",
+            }}
+          >
+            {COUNTIES_BY_STATE[stateFilter].map((c) => (
+              <option key={c.key} value={c.key}>{c.label}</option>
+            ))}
+          </select>
+        )}
 
         {/* Search */}
         <div style={{ flex: 1, minWidth: 200, position: "relative" }}>
@@ -263,7 +334,7 @@ export default function LeadsDashboard() {
             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
               <thead>
                 <tr style={{ background: "var(--surface)", borderBottom: "2px solid var(--border)" }}>
-                  {["Address", "Owner Name", "Phone", "Source", "Score", "Date Found", "Status"].map((h) => (
+                  {["Address", "Location", "Owner Name", "Phone", "Source", "Score", "Date Found", "Status"].map((h) => (
                     <th key={h} style={{
                       padding: "10px 16px",
                       textAlign: "left",
@@ -304,6 +375,28 @@ export default function LeadsDashboard() {
                       <div style={{ fontWeight: 500, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                         {lead.address}
                       </div>
+                    </td>
+                    <td style={{ padding: "12px 16px", whiteSpace: "nowrap" }}>
+                      {lead.state || lead.county ? (
+                        <span style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: 4,
+                          padding: "2px 8px",
+                          borderRadius: 12,
+                          fontSize: 11,
+                          fontWeight: 600,
+                          background: lead.state === "GA"
+                            ? "rgba(16,185,129,0.12)"
+                            : "rgba(59,130,246,0.12)",
+                          color: lead.state === "GA" ? "#10b981" : "#3b82f6",
+                        }}>
+                          {lead.state === "GA" ? "🍑" : "🗽"}
+                          {lead.state}{lead.county ? ` · ${lead.county}` : ""}
+                        </span>
+                      ) : (
+                        <span style={{ color: "var(--muted)" }}>—</span>
+                      )}
                     </td>
                     <td style={{ padding: "12px 16px", color: "var(--text)", whiteSpace: "nowrap" }}>
                       {lead.owner_name ?? <span style={{ color: "var(--muted)" }}>—</span>}

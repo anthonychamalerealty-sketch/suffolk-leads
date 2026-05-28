@@ -11,6 +11,9 @@ export async function GET(req: NextRequest) {
     const search = searchParams.get("search") || "";
     const status = searchParams.get("status") || "";
 
+    const state = searchParams.get("state") || "";
+    const county = searchParams.get("county") || "";
+
     let sql = `
       SELECT
         l.id,
@@ -21,6 +24,8 @@ export async function GET(req: NextRequest) {
         l.status,
         l.raw_data,
         l.parcel_id,
+        l.state,
+        l.county,
         c.owner_name,
         c.phone,
         c.email,
@@ -46,6 +51,14 @@ export async function GET(req: NextRequest) {
     if (status) {
       sql += " AND l.status = ?";
       params.push(status);
+    }
+    if (state) {
+      sql += " AND l.state = ?";
+      params.push(state);
+    }
+    if (county) {
+      sql += " AND l.county = ?";
+      params.push(county);
     }
 
     sql += " ORDER BY l.created_at DESC";

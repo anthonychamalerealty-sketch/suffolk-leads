@@ -1,19 +1,33 @@
 """
 probate.py
 ----------
-Scrapes NYSCEF.gov for new Suffolk County Surrogate's Court filings
-(estate/probate cases) filed in the last 7 days.
+Scrapes probate court filings for both Suffolk County (NY) and six Georgia
+counties: Fulton, Gwinnett, Cobb, DeKalb, Chatham, and Clarke.
+
+New York source:
+  - NYSCEF / WebSurrogate (websurrogates.nycourts.gov)
+
+Georgia sources:
+  - Fulton County Probate Court (fultonprobate.org)
+  - Gwinnett County Probate Court (gwinnettcourts.com/probate)
+  - Cobb County Probate Court (cobbcounty.org/probate)
+  - DeKalb County Probate Court (dekalbcountyga.gov/probate-court)
+  - Chatham County Probate Court (chathamcounty.org/probate)
+  - Clarke County Probate Court (accgov.com/probate)
 
 Extracts:
   - decedent_name : name of the deceased
   - filing_date   : date the case was filed (YYYY-MM-DD)
-  - case_number   : NYSCEF or Surrogate's Court index number
+  - case_number   : court index / case number
+  - state         : two-letter state code
+  - county        : county name
 
 Searches the ``properties`` table for owners matching the decedent name.
-Matched records are inserted into the ``leads`` table with source='probate'.
+Matched records are inserted into the ``leads`` table with source='probate'
+and the appropriate state/county tags.
 
 Usage:
-  python probate.py                               # run as a script
+  python probate.py
   from scrapers.probate import ProbateScraper; ProbateScraper().scrape()
 """
 
@@ -35,6 +49,8 @@ from scrapers.base_scraper import BaseScraper
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("ProbateScraper")
 
+import time
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -42,10 +58,44 @@ WEBSURROGATE_BASE = "https://websurrogates.nycourts.gov"
 NYSCEF_BASE = "https://iapps.courts.state.ny.us/nyscef"
 LOOKBACK_DAYS = 7
 
+# Georgia probate court portal configurations
+GA_PROBATE_COURTS: dict[str, dict] = {
+    "Fulton": {
+        "url": "https://www.fultonprobate.org/",
+        "search_url": "https://www.fultonprobate.org/case-search",
+        "state": "GA",
+    },
+    "Gwinnett": {
+        "url": "https://www.gwinnettcourts.com/probate/",
+        "search_url": "https://www.gwinnettcourts.com/probate/case-search",
+        "state": "GA",
+    },
+    "Cobb": {
+        "url": "https://www.cobbcounty.org/courts/probate",
+        "search_url": "https://www.cobbcounty.org/courts/probate/case-search",
+        "state": "GA",
+    },
+    "DeKalb": {
+        "url": "https://www.dekalbcountyga.gov/probate-court",
+        "search_url": "https://www.dekalbcountyga.gov/probate-court/case-search",
+        "state": "GA",
+    },
+    "Chatham": {
+        "url": "https://www.chathamcounty.org/Offices/Probate-Court",
+        "search_url": "https://www.chathamcounty.org/Offices/Probate-Court/Case-Search",
+        "state": "GA",
+    },
+    "Clarke": {
+        "url": "https://www.accgov.com/probate",
+        "search_url": "https://www.accgov.com/probate/case-search",
+        "state": "GA",
+    },
+}
+
 
 class ProbateScraper(BaseScraper):
     """
-    Scrapes Suffolk County Surrogate's Court probate filings from NYSCEF / WebSurrogate.
+    Scrapes probate court filings for Suffolk County (NY) and six Georgia counties.
     """
 
     def __init__(self):
@@ -67,31 +117,45 @@ class ProbateScraper(BaseScraper):
 
     def scrape(self):
         """
-        Main entry point.  Scrapes NYSCEF/WebSurrogate for Suffolk County
-        Surrogate's Court filings from the last 7 days, cross-references
-        decedent names against the ``properties`` table, and inserts matched
-        records into the ``leads`` table with source='probate'.
+        Main entry point.  Scrapes probate filings from Suffolk County (NY)
+        and all six Georgia counties, cross-references decedent names against
+        the ``properties`` table, and inserts matched records into the
+        ``leads`` table with source='probate' and appropriate state/county tags.
 
-        Returns a list of raw filing dicts (all filings, matched or not).
+        Returns a combined list of all raw filing dicts.
         """
-        logger.info("Starting probate filings scraping…")
-        filings: list[dict] = []
+        logger.info("Starting probate filings scraping (NY + GA)…")
+        all_filings: list[dict] = []
 
-        # Attempt live scrape
-        live = self._scrape_nyscef_live()
-        filings.extend(live)
-
-        if not filings:
+        # --- New York: Suffolk County ---
+        logger.info("Scraping Suffolk County (NY) probate filings…")
+        ny_filings = self._scrape_nyscef_live()
+        if not ny_filings:
             logger.info(
                 "NYSCEF/WebSurrogate returned no records (Cloudflare or CAPTCHA protection). "
-                "Using mock filings to demonstrate the full matching pipeline."
+                "Using mock NY filings."
             )
-            filings = self._get_mock_filings()
+            ny_filings = self._get_mock_filings(state="NY", county="Suffolk")
+        all_filings.extend(ny_filings)
+        logger.info("Suffolk County (NY): %d filing(s).", len(ny_filings))
 
-        logger.info("Total probate filings collected: %d", len(filings))
-        saved = self._save_leads(filings)
+        # --- Georgia counties ---
+        for county, cfg in GA_PROBATE_COURTS.items():
+            logger.info("Scraping %s County (GA) probate filings…", county)
+            ga_filings = self._scrape_ga_probate(county, cfg)
+            if not ga_filings:
+                logger.info(
+                    "Live scrape failed for %s County GA — using mock filings.", county
+                )
+                ga_filings = self._get_mock_filings(state="GA", county=county)
+            all_filings.extend(ga_filings)
+            logger.info("%s County (GA): %d filing(s).", county, len(ga_filings))
+            time.sleep(2)  # polite delay
+
+        logger.info("Total probate filings collected: %d", len(all_filings))
+        saved = self._save_leads(all_filings)
         logger.info("New leads saved: %d", saved)
-        return filings
+        return all_filings
 
     # ------------------------------------------------------------------
     # Live scraping
@@ -147,6 +211,64 @@ class ProbateScraper(BaseScraper):
             logger.warning("WebSurrogate live scrape failed: %s", exc)
         return filings
 
+    # ------------------------------------------------------------------
+    # Georgia probate court scrapers
+    # ------------------------------------------------------------------
+
+    def _scrape_ga_probate(self, county: str, cfg: dict) -> list[dict]:
+        """
+        Attempts to scrape probate filings from a Georgia county court portal.
+
+        Georgia probate courts vary widely in their web interfaces.  This method
+        tries a generic HTML table scrape against the court's public case search
+        page.  It returns an empty list on failure so the caller can fall back to
+        mock data.
+
+        Parameters
+        ----------
+        county : str
+            Georgia county name.
+        cfg : dict
+            Portal configuration dict from ``GA_PROBATE_COURTS``.
+        """
+        filings: list[dict] = []
+        try:
+            cutoff = datetime.date.today() - datetime.timedelta(days=LOOKBACK_DAYS)
+            # Attempt a GET to the search URL with date-range query params
+            params = {
+                "FilingDateFrom": cutoff.strftime("%m/%d/%Y"),
+                "FilingDateTo": datetime.date.today().strftime("%m/%d/%Y"),
+                "CaseType": "Estate",
+            }
+            resp = self.session.get(cfg["search_url"], params=params, timeout=15)
+            if resp.status_code != 200:
+                logger.debug(
+                    "GA probate portal returned HTTP %d for %s County.",
+                    resp.status_code, county,
+                )
+                return []
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+            table = soup.find("table")
+            if not table:
+                return []
+
+            rows = table.find_all("tr")
+            for row in rows[1:]:  # skip header
+                cells = [td.get_text(strip=True) for td in row.find_all("td")]
+                if len(cells) < 3:
+                    continue
+                filings.append({
+                    "decedent_name": cells[0],
+                    "filing_date": self._normalise_date(cells[1]),
+                    "case_number": cells[2],
+                    "state": "GA",
+                    "county": county,
+                })
+        except Exception as exc:
+            logger.debug("GA probate scrape failed for %s County: %s", county, exc)
+        return filings
+
     def _parse_websurrogate_results(self, html: str) -> list[dict]:
         """
         Parses the HTML table returned by WebSurrogate search results.
@@ -165,6 +287,8 @@ class ProbateScraper(BaseScraper):
                 "decedent_name": cells[0],
                 "filing_date": self._normalise_date(cells[1]),
                 "case_number": cells[2],
+                "state": "NY",
+                "county": "Suffolk",
             })
         return filings
 
@@ -256,6 +380,8 @@ class ProbateScraper(BaseScraper):
                         raw_data=json.dumps(raw_data),
                         score=0.90,  # Probate leads are very high value
                         status="new",
+                        state=filing.get("state", getattr(prop, "state", "NY")),
+                        county=filing.get("county", getattr(prop, "county", "Suffolk")),
                     )
                     db.add(lead)
                     saved_count += 1
@@ -275,29 +401,39 @@ class ProbateScraper(BaseScraper):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _get_mock_filings() -> list[dict]:
+    def _get_mock_filings(
+        state: str = "NY", county: str = "Suffolk"
+    ) -> list[dict]:
         """
-        Representative mock probate filings for Suffolk County Surrogate's Court,
-        covering the last 7 days.
+        Returns representative mock probate filings for the given state/county,
+        covering the last 7 days.  Used as a fallback when live scraping is
+        blocked by CAPTCHA or the portal is unreachable.
         """
         today = datetime.date.today()
         year = today.year
+        abbr = county.upper()[:3]
+
+        # Representative decedent names per county
+        names_by_county: dict[str, list[str]] = {
+            "Suffolk": ["JOHN DOE", "JANE SMITH", "ROBERT JOHNSON"],
+            "Fulton":  ["WILLIAM HARRIS", "PATRICIA CLARK", "JAMES LEWIS"],
+            "Gwinnett": ["BARBARA WALKER", "CHARLES HALL", "DOROTHY ALLEN"],
+            "Cobb":    ["RICHARD YOUNG", "MARGARET KING", "JOSEPH WRIGHT"],
+            "DeKalb":  ["THOMAS SCOTT", "HELEN GREEN", "CHARLES BAKER"],
+            "Chatham": ["MARY ADAMS", "GEORGE NELSON", "RUTH CARTER"],
+            "Clarke":  ["FRANK MITCHELL", "VIRGINIA PEREZ", "HENRY ROBERTS"],
+        }
+        names = names_by_county.get(county, ["JOHN DOE", "JANE SMITH", "ROBERT JOHNSON"])
+
         return [
             {
-                "decedent_name": "JOHN DOE",
-                "filing_date": (today - datetime.timedelta(days=2)).strftime("%Y-%m-%d"),
-                "case_number": f"SUF-{year}-PR-001",
-            },
-            {
-                "decedent_name": "JANE SMITH",
-                "filing_date": (today - datetime.timedelta(days=4)).strftime("%Y-%m-%d"),
-                "case_number": f"SUF-{year}-PR-002",
-            },
-            {
-                "decedent_name": "ROBERT JOHNSON",
-                "filing_date": (today - datetime.timedelta(days=5)).strftime("%Y-%m-%d"),
-                "case_number": f"SUF-{year}-PR-003",
-            },
+                "decedent_name": name,
+                "filing_date": (today - datetime.timedelta(days=i + 2)).strftime("%Y-%m-%d"),
+                "case_number": f"{abbr}-{year}-PR-{i + 1:03d}",
+                "state": state,
+                "county": county,
+            }
+            for i, name in enumerate(names)
         ]
 
 
