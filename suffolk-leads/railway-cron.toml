@@ -11,7 +11,7 @@
 #        DATABASE_URL       — shared PostgreSQL connection string
 #        SENDGRID_API_KEY   — your SendGrid API key
 #        DIGEST_EMAIL       — Anthonychamalerealty@gmail.com
-#   5. Railway will run `python jobs/daily_digest.py` at 07:00 AM Eastern Time
+#   5. Railway will run `python jobs/run_all.py` at 07:00 AM Eastern Time
 #      (11:00 AM UTC) every day.  The service exits when the script completes.
 #
 # Note: Railway cron schedules are UTC-based.
@@ -23,6 +23,6 @@
 builder = "Nixpacks"
 
 [deploy]
-startCommand = "python jobs/daily_digest.py"
+startCommand = "python jobs/run_all.py"
 cronSchedule = "0 11 * * *"
 restartPolicyType = "never"

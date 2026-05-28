@@ -228,8 +228,8 @@ def send_email_with_sendgrid(
     to_email: str,
     subject: str,
     html_content: str,
-    attachment_path: str,
-    attachment_filename: str
+    attachment_path: str = None,
+    attachment_filename: str = None
 ) -> bool:
     """
     Send email with attachment using SendGrid API.
@@ -253,22 +253,23 @@ def send_email_with_sendgrid(
     )
 
     # Read and encode attachment
-    try:
-        with open(attachment_path, "rb") as f:
-            data = f.read()
-            encoded_file = base64.b64encode(data).decode()
-        
-        attached_file = Attachment(
-            FileContent(encoded_file),
-            FileName(attachment_filename),
-            FileType("text/csv"),
-            Disposition("attachment")
-        )
-        message.attachment = attached_file
-        logger.info(f"Attached {attachment_filename} to the email.")
-    except Exception as exc:
-        logger.error(f"Failed to attach file: {exc}", exc_info=True)
-        return False
+    if attachment_path and attachment_filename:
+        try:
+            with open(attachment_path, "rb") as f:
+                data = f.read()
+                encoded_file = base64.b64encode(data).decode()
+            
+            attached_file = Attachment(
+                FileContent(encoded_file),
+                FileName(attachment_filename),
+                FileType("text/csv"),
+                Disposition("attachment")
+            )
+            message.attachment = attached_file
+            logger.info(f"Attached {attachment_filename} to the email.")
+        except Exception as exc:
+            logger.error(f"Failed to attach file: {exc}", exc_info=True)
+            return False
 
     try:
         sg = SendGridAPIClient(api_key)
@@ -290,6 +291,25 @@ def main() -> None:
     today = datetime.datetime.now()
     date_str = today.strftime("%Y-%m-%d")
     
+    digest_email = os.getenv("DIGEST_EMAIL", "Anthonychamalerealty@gmail.com")
+
+    # If no leads are found, send a test email as requested
+    if not leads:
+        subject = "Suffolk Leads - System Test"
+        html_email = "System is running correctly. No new leads found in the last 24 hours."
+        logger.info(f"No leads found. Sending system test email to {digest_email}...")
+        success = send_email_with_sendgrid(
+            to_email=digest_email,
+            subject=subject,
+            html_content=html_email
+        )
+        if success:
+            logger.info("System test email sent successfully. Daily digest process completed.")
+        else:
+            logger.error("System test email failed during delivery.")
+            sys.exit(1)
+        return
+    
     csv_filename = f"suffolk-leads-{date_str}.csv"
     csv_path = os.path.join(os.getcwd(), csv_filename)
     
@@ -300,7 +320,6 @@ def main() -> None:
     html_email = build_html_email(leads, date_str)
     
     # 4. Send email
-    digest_email = os.getenv("DIGEST_EMAIL", "Anthonychamalerealty@gmail.com")
     subject = f"Suffolk Leads Daily Digest - {date_str} ({len(leads)} leads)"
     
     logger.info(f"Sending digest to {digest_email}...")
