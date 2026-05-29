@@ -804,13 +804,14 @@ class ProbateScraper(BaseScraper):
         try:
             db = SessionLocal()
             try:
-                # Dedup by file_number
+                # Dedup by file_number — use .like() for SQLite compatibility
+                _fn = filing["file_number"]
                 existing = db.query(Lead).filter(
                     Lead.source == "probate",
-                    Lead.raw_data.contains(filing["file_number"])
+                    Lead.raw_data.like(f"%{_fn}%")
                 ).first()
                 if existing:
-                    print(f"[probate]   DUPLICATE: {filing['file_number']} (lead id={existing.id})", flush=True)
+                    print(f"[probate]   DUPLICATE: {_fn} (lead id={existing.id})", flush=True)
                     return False
 
                 decedent_addr = self._build_addr(pdf_data, "decedent")
@@ -902,12 +903,14 @@ class ProbateScraper(BaseScraper):
         try:
             db = SessionLocal()
             try:
+                # Dedup by file_number — use .like() for SQLite compatibility
+                _fn = filing["file_number"]
                 existing = db.query(Lead).filter(
                     Lead.source == "probate",
-                    Lead.raw_data.contains(filing["file_number"])
+                    Lead.raw_data.like(f"%{_fn}%")
                 ).first()
                 if existing:
-                    print(f"[probate]   DUPLICATE: {filing['file_number']}", flush=True)
+                    print(f"[probate]   DUPLICATE: {_fn}", flush=True)
                     return False
 
                 decedent = next(
