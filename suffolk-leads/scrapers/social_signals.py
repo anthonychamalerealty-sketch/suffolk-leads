@@ -432,87 +432,107 @@ class SocialSignalsScraper(BaseScraper):
     # ------------------------------------------------------------------
     def _save_leads(self, posts: list[dict]) -> int:
         """
-        Processes posts, extracts addresses, cross-references against the
-        properties table, and inserts matched records into the leads table.
+        Saves every relevant post directly as a lead - no property match required.
+        If a matching property record exists it is linked; otherwise parcel_id is NULL
+        and owner_name is set to 'Unknown - needs lookup'.
         Returns the number of new leads inserted.
         """
+        import traceback as _tb
+        if not SessionLocal:
+            print("[social_signals] _save_leads: SessionLocal not available - DB import failed.", flush=True)
+            return 0
+
+        print(f"[social_signals] _save_leads: attempting to save {len(posts)} post(s).", flush=True)
         saved_count = 0
         session = SessionLocal()
         try:
-            properties = session.query(Property).all()
-            logger.info(f"Loaded {len(properties)} properties from the database for cross-referencing.")
+            # Load properties once for optional cross-referencing (enrichment only)
+            try:
+                properties = session.query(Property).all() if Property else []
+                print(f"[social_signals] Properties in DB: {len(properties)}", flush=True)
+            except Exception as prop_exc:
+                print(f"[social_signals] Could not load properties: {prop_exc}", flush=True)
+                properties = []
 
-            for post in posts:
-                # Attempt to extract street address from title or combined text
-                extracted_addr = self._extract_address(post["text"])
+            for idx, post in enumerate(posts):
+                # Attempt to extract street address from post text
+                extracted_addr = self._extract_address(post.get("text", ""))
                 if not extracted_addr:
-                    # Try title specifically if combined text did not yield anything
-                    extracted_addr = self._extract_address(post["title"])
-                
-                if not extracted_addr:
+                    extracted_addr = self._extract_address(post.get("title", ""))
+
+                post_url = post.get("url", "")
+                post_title = post.get("title", "")[:80]
+                state = post.get("state", "NY")
+                county = post.get("county", "Suffolk")
+
+                # Use extracted address if found, else use source location as placeholder
+                if extracted_addr:
+                    address = extracted_addr
+                else:
+                    address = f"Social signal - {post.get('source', 'unknown')} - {state}"
+
+                print(f"[social_signals]   post[{idx}]: addr='{address[:50]}' source={post.get('source','?')}", flush=True)
+
+                # Optional: try to find a matching property record
+                matched_prop = None
+                if extracted_addr:
+                    for prop in properties:
+                        if self._address_matches_property(extracted_addr, prop.address or ""):
+                            matched_prop = prop
+                            print(f"[social_signals]   MATCH: address matched property (owner: {prop.owner_name})", flush=True)
+                            break
+
+                # Deduplication: one lead per post URL
+                if post_url:
+                    try:
+                        existing = (
+                            session.query(Lead)
+                            .filter(Lead.source == "social_signal", Lead.raw_data.like(f"%{post_url[:60]}%"))
+                            .first()
+                        )
+                        if existing:
+                            print(f"[social_signals]   DUPLICATE: lead already exists for this post URL - skipping.", flush=True)
+                            continue
+                    except Exception as dup_exc:
+                        print(f"[social_signals]   Dedup check error: {dup_exc}", flush=True)
+
+                raw_data = {
+                    "scraped_address": extracted_addr or "",
+                    "post_title":      post_title,
+                    "post_text":       post.get("text", "")[:500],
+                    "post_url":        post_url,
+                    "source":          post.get("source", ""),
+                    "date":            post.get("date", ""),
+                    "owner_name":      matched_prop.owner_name if matched_prop else "Unknown - needs lookup",
+                }
+                lead = Lead(
+                    address=matched_prop.address if matched_prop else address,
+                    parcel_id=matched_prop.parcel_id if matched_prop else None,
+                    source="social_signal",
+                    raw_data=json.dumps(raw_data),
+                    score=0.80,
+                    status="new",
+                    state=state,
+                    county=county,
+                )
+                try:
+                    session.add(lead)
+                    session.flush()
+                    saved_count += 1
+                    print(f"[social_signals]   SAVED: lead id={lead.id} | {address[:60]} | parcel={lead.parcel_id or 'NULL'}", flush=True)
+                except Exception as ins_exc:
+                    session.rollback()
+                    print(f"[social_signals]   INSERT ERROR: {ins_exc}", flush=True)
+                    _tb.print_exc()
                     continue
 
-                logger.info(f"Extracted address '{extracted_addr}' from post: '{post['title'][:40]}...'")
-
-                # Cross-reference against properties table
-                for prop in properties:
-                    if not self._address_matches_property(extracted_addr, prop.address):
-                        continue
-
-                    logger.info(
-                        "MATCH FOUND: '%s' (from %s) -> property '%s' (owner: %s)",
-                        extracted_addr, post["source"], prop.address, prop.owner_name
-                    )
-
-                    # Deduplication: one social_signal lead per parcel per post URL
-                    existing = (
-                        session.query(Lead)
-                        .filter(
-                            Lead.parcel_id == prop.parcel_id,
-                            Lead.source == "social_signal",
-                            Lead.raw_data.like(f'%"{post["url"]}"%') | Lead.raw_data.like(f'%{post["url"]}%')
-                        )
-                        .first()
-                    )
-                    if existing:
-                        logger.info(f"  Lead already exists for parcel {prop.parcel_id} with this post — skipping.")
-                        continue
-
-                    raw_data = {
-                        "scraped_address": extracted_addr,
-                        "post_title": post["title"],
-                        "post_text": post["text"],
-                        "post_url": post["url"],
-                        "source": post["source"],
-                        "date": post["date"],
-                        "owner_name": prop.owner_name,
-                    }
-
-                    # Social signal leads are high-intent/motivated seller signals
-                    lead = Lead(
-                        address=prop.address,
-                        parcel_id=prop.parcel_id,
-                        source="social_signal",
-                        raw_data=json.dumps(raw_data),
-                        score=0.80,  # Highly motivated signal
-                        status="new",
-                        state=post.get("state", getattr(prop, "state", "NY")),
-                        county=post.get("county", getattr(prop, "county", "Suffolk")),
-                    )
-                    session.add(lead)
-                    saved_count += 1
-                    logger.info(f"  Saved new lead for parcel {prop.parcel_id} (score=0.80)")
-
             session.commit()
-        except Exception as e:
+            print(f"[social_signals] _save_leads: committed. Total new leads saved: {saved_count}", flush=True)
+        except Exception as exc:
             session.rollback()
-            logger.error(f"Error saving leads to database: {e}")
-            raise
+            print(f"[social_signals] _save_leads: FATAL error - {exc}", flush=True)
+            _tb.print_exc()
         finally:
             session.close()
-
         return saved_count
 
-if __name__ == "__main__":
-    scraper = SocialSignalsScraper()
-    scraper.scrape()

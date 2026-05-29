@@ -554,77 +554,107 @@ class ObituaryScraper(BaseScraper):
 
     def _save_leads(self, obituaries: list[dict]) -> int:
         """
-        Cross-references each deceased name against the ``properties`` table
-        and inserts a new ``Lead`` record for every match.
-
+        Saves every scraped obituary directly as a lead - no property match required.
+        If a matching property record exists it is linked; otherwise parcel_id is NULL
+        and owner_name is set to 'Unknown - needs lookup'.
         Returns the number of new leads inserted.
         """
+        import traceback as _tb
+        if not SessionLocal:
+            print("[obituary] _save_leads: SessionLocal not available - DB import failed.", flush=True)
+            return 0
+
+        print(f"[obituary] _save_leads: attempting to save {len(obituaries)} obituary record(s).", flush=True)
         saved_count = 0
         db = SessionLocal()
         try:
-            properties = db.query(Property).all()
-            for obit in obituaries:
-                deceased = obit["deceased_name"]
-                town = obit.get("town", "")
+            # Load properties once for optional cross-referencing (enrichment only)
+            try:
+                properties = db.query(Property).all() if Property else []
+                print(f"[obituary] Properties in DB: {len(properties)}", flush=True)
+            except Exception as prop_exc:
+                print(f"[obituary] Could not load properties: {prop_exc}", flush=True)
+                properties = []
 
+            for idx, obit in enumerate(obituaries):
+                deceased = obit.get("deceased_name", "").strip()
+                if not deceased:
+                    print(f"[obituary]   obit[{idx}]: no deceased_name - skipping.", flush=True)
+                    continue
+
+                # Optional: try to find a matching property record by name
+                matched_prop = None
                 for prop in properties:
-                    if not self._is_name_match(deceased, prop.owner_name):
-                        continue
+                    if self._is_name_match(deceased, prop.owner_name or ""):
+                        matched_prop = prop
+                        print(f"[obituary]   MATCH: deceased name matched property owner (parcel: {prop.parcel_id})", flush=True)
+                        break
 
-                    # Optional: if we know the town, verify it appears in the property address
-                    if town and not self._is_suffolk_county(prop.address):
-                        # Property address doesn't mention any Suffolk town — skip
-                        pass  # We still accept the match; town filter is advisory
-
-                    logger.info(
-                        "MATCH: deceased '%s' (%s) → owner '%s' at '%s'",
-                        deceased, town, prop.owner_name, prop.address,
-                    )
-
-                    # Deduplication: one obituary lead per parcel
+                # Deduplication: one obituary lead per deceased name
+                try:
                     existing = (
                         db.query(Lead)
                         .filter(
-                            Lead.parcel_id == prop.parcel_id,
                             Lead.source == "obituary",
+                            Lead.raw_data.like(f"%{deceased[:30]}%"),
                         )
                         .first()
                     )
                     if existing:
-                        logger.info("  Lead already exists for parcel %s — skipping.", prop.parcel_id)
+                        print(f"[obituary]   DUPLICATE: lead already exists for {deceased} - skipping.", flush=True)
                         continue
+                except Exception as dup_exc:
+                    print(f"[obituary]   Dedup check error: {dup_exc}", flush=True)
 
-                    raw_data = {
-                        "deceased_name": deceased,
-                        "town": town,
-                        "surviving_family": obit.get("surviving_family", []),
-                        "published_date": obit.get("published_date", ""),
-                        "source_url": obit.get("source_url", ""),
-                        "property_address": prop.address,
-                        "owner_name": prop.owner_name,
-                    }
+                # Build address: use property address if matched, else town/state from obit
+                town = obit.get("town", "")
+                state = obit.get("state", "NY")
+                county = obit.get("county", "Suffolk")
+                if matched_prop:
+                    address = matched_prop.address
+                elif town:
+                    address = f"{deceased} estate - {town}, {state}"
+                else:
+                    address = f"{deceased} estate - {state}"
 
-                    lead = Lead(
-                        address=prop.address,
-                        parcel_id=prop.parcel_id,
-                        source="obituary",
-                        raw_data=json.dumps(raw_data),
-                        score=0.75,  # Obituary leads are high value
-                        status="new",
-                        state=obit.get("state", getattr(prop, "state", "NY")),
-                        county=obit.get("county", getattr(prop, "county", "Suffolk")),
-                    )
+                raw_data = {
+                    "deceased_name":    deceased,
+                    "town":             town,
+                    "surviving_family": obit.get("surviving_family", []),
+                    "published_date":   obit.get("published_date", ""),
+                    "source_url":       obit.get("source_url", ""),
+                    "property_address": matched_prop.address if matched_prop else "",
+                    "owner_name":       matched_prop.owner_name if matched_prop else "Unknown - needs lookup",
+                }
+                lead = Lead(
+                    address=address,
+                    parcel_id=matched_prop.parcel_id if matched_prop else None,
+                    source="obituary",
+                    raw_data=json.dumps(raw_data),
+                    score=0.75,
+                    status="new",
+                    state=state,
+                    county=county,
+                )
+                try:
                     db.add(lead)
+                    db.flush()
                     saved_count += 1
-                    logger.info("  Saved new obituary lead for parcel %s.", prop.parcel_id)
+                    print(f"[obituary]   SAVED: lead id={lead.id} | {deceased} | {address[:60]} | parcel={lead.parcel_id or 'NULL'}", flush=True)
+                except Exception as ins_exc:
+                    db.rollback()
+                    print(f"[obituary]   INSERT ERROR for {deceased}: {ins_exc}", flush=True)
+                    _tb.print_exc()
+                    continue
 
             db.commit()
-        except Exception:
+            print(f"[obituary] _save_leads: committed. Total new leads saved: {saved_count}", flush=True)
+        except Exception as exc:
             db.rollback()
-            raise
+            print(f"[obituary] _save_leads: FATAL error - {exc}", flush=True)
+            _tb.print_exc()
         finally:
             db.close()
-
         return saved_count
 
     # ------------------------------------------------------------------

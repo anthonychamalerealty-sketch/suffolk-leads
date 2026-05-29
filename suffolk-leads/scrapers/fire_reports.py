@@ -373,72 +373,95 @@ class FireReportsScraper(BaseScraper):
 
     def _save_leads(self, incidents: list[dict]) -> int:
         """
-        Cross-references each incident address against the ``properties`` table
-        and inserts a new ``Lead`` record for every match.
-
+        Saves every scraped incident directly as a lead - no property match required.
+        If a matching property record exists it is linked; otherwise parcel_id is NULL
+        and owner_name is set to 'Unknown - needs lookup'.
         Returns the number of new leads inserted.
         """
+        import traceback as _tb
+        if not SessionLocal:
+            print("[fire_reports] _save_leads: SessionLocal not available - DB import failed.", flush=True)
+            return 0
+
+        print(f"[fire_reports] _save_leads: attempting to save {len(incidents)} incident(s).", flush=True)
         saved_count = 0
         session = SessionLocal()
         try:
-            properties = session.query(Property).all()
-            for inc in incidents:
-                is_residential = self._is_residential_structure_fire(inc["incident_type"])
+            # Load properties once for optional cross-referencing (enrichment only)
+            try:
+                properties = session.query(Property).all() if Property else []
+                print(f"[fire_reports] Properties in DB: {len(properties)}", flush=True)
+            except Exception as prop_exc:
+                print(f"[fire_reports] Could not load properties: {prop_exc}", flush=True)
+                properties = []
 
+            for idx, inc in enumerate(incidents):
+                is_residential = self._is_residential_structure_fire(inc.get("incident_type", ""))
+                address = inc.get("address", "").strip()
+                if not address:
+                    print(f"[fire_reports]   incident[{idx}]: no address - skipping.", flush=True)
+                    continue
+
+                # Optional: try to find a matching property record
+                matched_prop = None
                 for prop in properties:
-                    if not self._address_matches_property(inc["address"], prop.address):
-                        continue
+                    if self._address_matches_property(address, prop.address or ""):
+                        matched_prop = prop
+                        print(f"[fire_reports]   MATCH: address matched property (owner: {prop.owner_name})", flush=True)
+                        break
 
-                    logger.info(
-                        "MATCH: '%s' → property '%s' (owner: %s)",
-                        inc["address"], prop.address, prop.owner_name,
-                    )
-
-                    # Deduplication: one fire_report lead per parcel per day
-                    today_str = datetime.date.today().isoformat()
+                # Deduplication: skip if a lead for this address+source already exists
+                try:
+                    addr_key = address[:40]
                     existing = (
                         session.query(Lead)
-                        .filter(
-                            Lead.parcel_id == prop.parcel_id,
-                            Lead.source == "fire_report",
-                        )
+                        .filter(Lead.address.ilike(f"%{addr_key}%"), Lead.source == "fire_report")
                         .first()
                     )
                     if existing:
-                        logger.info("  Lead already exists for parcel %s — skipping.", prop.parcel_id)
+                        print(f"[fire_reports]   DUPLICATE: lead already exists for address - skipping.", flush=True)
                         continue
+                except Exception as dup_exc:
+                    print(f"[fire_reports]   Dedup check error: {dup_exc}", flush=True)
 
-                    raw_data = {
-                        "scraped_address": inc["address"],
-                        "scraped_date": inc["date"],
-                        "incident_type": inc["incident_type"],
-                        "is_residential_structure_fire": is_residential,
-                        "owner_name": prop.owner_name,
-                        "owner_mailing_address": prop.owner_mailing_address,
-                    }
-
-                    lead = Lead(
-                        address=prop.address,
-                        parcel_id=prop.parcel_id,
-                        source="fire_report",
-                        raw_data=json.dumps(raw_data),
-                        # Residential structure fires score higher — they signal motivated sellers
-                        score=0.85 if is_residential else 0.55,
-                        status="new",
-                        state=inc.get("state", getattr(prop, "state", "NY")),
-                        county=inc.get("county", getattr(prop, "county", "Suffolk")),
-                    )
+                raw_data = {
+                    "scraped_address":             address,
+                    "scraped_date":                inc.get("date", ""),
+                    "incident_type":               inc.get("incident_type", ""),
+                    "is_residential_structure_fire": is_residential,
+                    "owner_name":                  matched_prop.owner_name if matched_prop else "Unknown - needs lookup",
+                    "owner_mailing_address":       matched_prop.owner_mailing_address if matched_prop else "",
+                    "fd_name":                     inc.get("fd_name", ""),
+                }
+                lead = Lead(
+                    address=matched_prop.address if matched_prop else address,
+                    parcel_id=matched_prop.parcel_id if matched_prop else None,
+                    source="fire_report",
+                    raw_data=json.dumps(raw_data),
+                    score=0.85 if is_residential else 0.55,
+                    status="new",
+                    state=inc.get("state", getattr(matched_prop, "state", "NY") if matched_prop else "NY"),
+                    county=inc.get("county", getattr(matched_prop, "county", "Suffolk") if matched_prop else "Suffolk"),
+                )
+                try:
                     session.add(lead)
+                    session.flush()
                     saved_count += 1
-                    logger.info("  Saved new lead for parcel %s (score=%.2f)", prop.parcel_id, lead.score)
+                    print(f"[fire_reports]   SAVED: lead id={lead.id} | {address[:60]} | score={lead.score} | parcel={lead.parcel_id or 'NULL'}", flush=True)
+                except Exception as ins_exc:
+                    session.rollback()
+                    print(f"[fire_reports]   INSERT ERROR for address: {ins_exc}", flush=True)
+                    _tb.print_exc()
+                    continue
 
             session.commit()
-        except Exception:
+            print(f"[fire_reports] _save_leads: committed. Total new leads saved: {saved_count}", flush=True)
+        except Exception as exc:
             session.rollback()
-            raise
+            print(f"[fire_reports] _save_leads: FATAL error - {exc}", flush=True)
+            _tb.print_exc()
         finally:
             session.close()
-
         return saved_count
 
     # ------------------------------------------------------------------
