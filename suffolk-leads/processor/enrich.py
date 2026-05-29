@@ -423,6 +423,123 @@ class CaptchaDetectedError(Exception):
 
 
 # ---------------------------------------------------------------------------
+# Tier 1c — TruePeopleSearch phone lookup (probate / petition leads)
+# ---------------------------------------------------------------------------
+
+async def _scrape_truepeoplesearch(name: str, address: str) -> list[str]:
+    """
+    Search TruePeopleSearch.com for *name* at *address* and return any phone
+    numbers found.
+
+    URL format:
+      https://www.truepeoplesearch.com/results?name=FIRST+LAST&citystatezip=CITY+STATE+ZIP
+
+    Returns an empty list on failure.  Raises CaptchaDetectedError on CAPTCHA.
+    """
+    import urllib.parse
+    try:
+        from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        logger.warning("playwright not installed — skipping TruePeopleSearch")
+        return []
+
+    name_parts = name.strip().split()
+    first_name = name_parts[0] if name_parts else ""
+    last_name   = name_parts[-1] if len(name_parts) > 1 else ""
+
+    # Extract city/state/zip from address string
+    addr_clean = address.strip()
+    parts = [p.strip() for p in addr_clean.split(",")]
+    if len(parts) >= 3:
+        city_state_zip = f"{parts[-2]} {parts[-1]}"
+    elif len(parts) == 2:
+        city_state_zip = parts[-1]
+    else:
+        tokens = addr_clean.split()
+        city_state_zip = " ".join(tokens[-3:]) if len(tokens) >= 3 else addr_clean
+
+    search_url = (
+        "https://www.truepeoplesearch.com/results"
+        f"?name={urllib.parse.quote(f'{first_name} {last_name}')}"
+        f"&citystatezip={urllib.parse.quote(city_state_zip)}"
+    )
+    logger.info("TruePeopleSearch URL: %s", search_url)
+    print(f"[enrich] TruePeopleSearch URL: {search_url}", flush=True)
+
+    phones: list[str] = []
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled", "--disable-dev-shm-usage"],
+        )
+        context = await browser.new_context(
+            user_agent=_random_ua(),
+            viewport={"width": random.randint(1280, 1920), "height": random.randint(768, 1080)},
+            locale="en-US",
+            timezone_id="America/New_York",
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "DNT": "1",
+            },
+        )
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+        page = await context.new_page()
+        try:
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
+            await asyncio.sleep(random.uniform(2.0, 4.0))
+            content = await page.content()
+
+            if _is_captcha_page(content):
+                logger.warning("CAPTCHA on TruePeopleSearch for '%s'", name)
+                print(f"[enrich] CAPTCHA on TruePeopleSearch for '{name}' — marking needs_manual_lookup", flush=True)
+                raise CaptchaDetectedError(name)
+
+            await _human_mouse_move(page, random.randint(300, 700), random.randint(200, 500))
+            await asyncio.sleep(random.uniform(1.0, 2.5))
+
+            # Try to click into the first profile for more phone numbers
+            try:
+                profile_link = await page.query_selector(
+                    "a[href*='/find/person/'], a[href*='/results/'], .card-summary a"
+                )
+                if profile_link:
+                    href = await profile_link.get_attribute("href")
+                    if href and not href.startswith("http"):
+                        href = "https://www.truepeoplesearch.com" + href
+                    print(f"[enrich] TruePeopleSearch: clicking profile {href}", flush=True)
+                    await _human_mouse_move(page, random.randint(200, 600), random.randint(200, 400))
+                    await asyncio.sleep(random.uniform(0.5, 1.5))
+                    await page.goto(href, wait_until="domcontentloaded", timeout=30_000)
+                    await asyncio.sleep(random.uniform(3.0, 5.0))
+                    content = await page.content()
+                    if _is_captcha_page(content):
+                        raise CaptchaDetectedError(name)
+            except CaptchaDetectedError:
+                raise
+            except Exception as _link_err:
+                logger.debug("TruePeopleSearch profile click failed: %s", _link_err)
+
+            phones = _extract_phones_from_html(content)
+            logger.info("TruePeopleSearch: %d phone(s) for '%s'", len(phones), name)
+            print(f"[enrich] TruePeopleSearch: {len(phones)} phone(s) found for '{name}'", flush=True)
+
+        except CaptchaDetectedError:
+            raise
+        except PWTimeout:
+            logger.warning("TruePeopleSearch timeout for '%s'", name)
+            print(f"[enrich] TruePeopleSearch timeout for '{name}'", flush=True)
+        except Exception as exc:
+            logger.warning("TruePeopleSearch error for '%s': %s", name, exc)
+            print(f"[enrich] TruePeopleSearch error for '{name}': {exc}", flush=True)
+        finally:
+            await browser.close()
+    return phones
+
+
+# ---------------------------------------------------------------------------
 # Tier 2a — NumVerify phone validation
 # ---------------------------------------------------------------------------
 
@@ -571,12 +688,87 @@ def enrich_lead(lead_id: int) -> None:
         )
         if not prop:
             logger.warning(
-                "No property record for lead %d (parcel_id=%s)", lead_id, lead.parcel_id
+                "No property record for lead %d (parcel_id=%s) — checking for petition contact",
+                lead_id, lead.parcel_id,
             )
-            # Still update status so we don't retry endlessly
+            print(f"[enrich] Lead {lead_id}: no property record — checking for petition_document contact", flush=True)
+            # ------------------------------------------------------------------
+            # Probate / petition leads have no property record but DO have a
+            # petitioner contact saved with source='petition_document'.  Run
+            # TruePeopleSearch as Tier 2 phone fallback if no phone was found
+            # in the petition PDF.
+            # ------------------------------------------------------------------
+            petition_contacts = (
+                session.query(Contact)
+                .filter(
+                    Contact.lead_id == lead_id,
+                    Contact.source == "petition_document",
+                )
+                .all()
+            )
+            if petition_contacts:
+                print(f"[enrich] Lead {lead_id}: found {len(petition_contacts)} petition_document contact(s)", flush=True)
+                # Score the lead based on source alone (no property)
+                new_score = compute_lead_score(lead, None)
+                lead.score = float(new_score)
+                print(f"[enrich] Lead {lead_id}: score={new_score}/10", flush=True)
+
+                for pc in petition_contacts:
+                    petitioner_name = pc.owner_name or ""
+                    petitioner_phone = pc.phone or ""
+                    petitioner_addr = pc.__dict__.get("mailing_address") or lead.address or ""
+
+                    if petitioner_phone:
+                        print(
+                            f"[enrich] Lead {lead_id}: petition phone already present ({petitioner_phone}) — Tier 2 skipped",
+                            flush=True,
+                        )
+                        continue  # Tier 1 already has a phone — skip TruePeopleSearch
+
+                    if not petitioner_name:
+                        print(f"[enrich] Lead {lead_id}: no petitioner name — skipping TruePeopleSearch", flush=True)
+                        continue
+
+                    print(
+                        f"[enrich] Lead {lead_id}: no petition phone for '{petitioner_name}' — running TruePeopleSearch",
+                        flush=True,
+                    )
+                    try:
+                        tps_phones = asyncio.run(
+                            _scrape_truepeoplesearch(petitioner_name, petitioner_addr)
+                        )
+                    except CaptchaDetectedError:
+                        lead.__dict__["enrich_status"] = "needs_manual_lookup"
+                        tps_phones = []
+                    except Exception as _tps_exc:
+                        logger.error("TruePeopleSearch failed for lead %d: %s", lead_id, _tps_exc)
+                        print(f"[enrich] TruePeopleSearch ERROR for lead {lead_id}: {_tps_exc}", flush=True)
+                        tps_phones = []
+
+                    for ph in tps_phones:
+                        _upsert_contact(
+                            session,
+                            lead_id=lead_id,
+                            owner_name=petitioner_name,
+                            phone=ph,
+                            email=None,
+                            source="truepeoplesearch",
+                            mailing_address=petitioner_addr,
+                        )
+                        print(f"[enrich] Lead {lead_id}: saved TruePeopleSearch phone {ph}", flush=True)
+
+                    # 5-second delay between TruePeopleSearch lookups
+                    if len(petition_contacts) > 1:
+                        time.sleep(5.0 + random.uniform(0.0, 2.0))
+
+            else:
+                print(f"[enrich] Lead {lead_id}: no petition_document contact — marking no_property_record", flush=True)
+
             lead.status = "enriched"
-            lead.__dict__["enrich_status"] = "no_property_record"
+            if not lead.__dict__.get("enrich_status"):
+                lead.__dict__["enrich_status"] = "no_property_record"
             session.commit()
+            print(f"[enrich] Lead {lead_id}: enrichment complete (no-property path)", flush=True)
             return
 
         # ------------------------------------------------------------------

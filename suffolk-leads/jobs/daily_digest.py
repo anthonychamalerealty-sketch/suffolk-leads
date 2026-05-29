@@ -182,24 +182,66 @@ def get_leads_last_24_hours() -> List[Dict[str, Any]]:
                     .filter(Property.parcel_id == lead.parcel_id)
                     .first()
                 )
-                contact = (
+                # Fetch ALL contacts for this lead, then pick the best phone
+                # Priority: petition_document > truepeoplesearch > usphonebook > any
+                all_contacts = (
                     session.query(Contact)
                     .filter(Contact.lead_id == lead.id)
-                    .first()
+                    .all()
                 )
-
+                _PHONE_PRIORITY = [
+                    "petition_document",
+                    "truepeoplesearch",
+                    "usphonebook",
+                    "numverify",
+                    "direct_mail",
+                    "hunter",
+                ]
+                best_phone = ""
+                best_phone_source = ""
+                best_email = ""
                 owner_name = ""
                 if prop and prop.owner_name:
                     owner_name = prop.owner_name
-                if contact and contact.owner_name:
-                    owner_name = contact.owner_name
+                # Walk contacts in priority order to find best phone
+                for _src in _PHONE_PRIORITY:
+                    for c in all_contacts:
+                        if c.source == _src and c.phone:
+                            best_phone = c.phone
+                            best_phone_source = _src
+                            break
+                    if best_phone:
+                        break
+                # Fallback: any contact with a phone
+                if not best_phone:
+                    for c in all_contacts:
+                        if c.phone:
+                            best_phone = c.phone
+                            best_phone_source = c.source or ""
+                            break
+                # Email: first available
+                for c in all_contacts:
+                    if c.email:
+                        best_email = c.email
+                        break
+                # Owner name: prefer petition_document contact
+                for c in all_contacts:
+                    if c.source == "petition_document" and c.owner_name:
+                        owner_name = c.owner_name
+                        break
+                if not owner_name:
+                    for c in all_contacts:
+                        if c.owner_name:
+                            owner_name = c.owner_name
+                            break
 
                 enriched.append({
                     "id": lead.id,
                     "address": lead.address or (prop.address if prop else ""),
                     "owner_name": owner_name,
-                    "phone": contact.phone if contact else "",
-                    "email": contact.email if contact else "",
+                    "phone": best_phone,
+                    "phone_source": best_phone_source,
+                    "email": best_email,
                     "source": lead.source or "",
                     "score": lead.score if lead.score is not None else 0.0,
                     "created_at": lead.created_at,
@@ -232,7 +274,7 @@ def generate_csv(leads: List[Dict[str, Any]], filename: str) -> bool:
     """
     logger.info(f"[CSV] Generating {filename} with {len(leads)} row(s) …")
     headers = [
-        "Address", "State", "County", "Owner Name", "Phone", "Email",
+        "Address", "State", "County", "Owner Name", "Phone", "Phone Source", "Email",
         "Source", "Score", "Created At (UTC)", "Status", "Parcel ID",
     ]
     try:
@@ -252,6 +294,7 @@ def generate_csv(leads: List[Dict[str, Any]], filename: str) -> bool:
                     lead["county"],
                     lead["owner_name"],
                     lead["phone"],
+                    lead.get("phone_source", ""),
                     lead["email"],
                     lead["source"],
                     lead["score"],
@@ -297,10 +340,28 @@ def build_html_email(leads: List[Dict[str, Any]], date_str: str) -> str:
     for idx, lead in enumerate(leads[:10], 1):
         score = lead["score"]
         color = "#e74c3c" if score >= 8 else ("#f39c12" if score >= 5 else "#2ecc71")
-        phone_html = (
-            lead["phone"]
-            or '<span style="color:#aaa;font-style:italic">None</span>'
-        )
+        _phone_source_labels = {
+            "petition_document": ("From petition", "#27ae60"),
+            "truepeoplesearch": ("From TruePeopleSearch", "#2980b9"),
+            "usphonebook": ("From USPhoneBook", "#8e44ad"),
+            "numverify": ("Verified", "#16a085"),
+            "direct_mail": ("Direct mail", "#d35400"),
+            "hunter": ("Hunter.io", "#c0392b"),
+        }
+        raw_phone = lead.get("phone") or ""
+        phone_src = lead.get("phone_source") or ""
+        if raw_phone:
+            label_text, label_color = _phone_source_labels.get(
+                phone_src, (phone_src.replace("_", " ").title() if phone_src else "", "#7f8c8d")
+            )
+            label_html = (
+                f' <span style="font-size:10px;background:{label_color};color:white;'
+                f'padding:1px 5px;border-radius:3px;vertical-align:middle">{label_text}</span>'
+                if label_text else ""
+            )
+            phone_html = f'<strong>{raw_phone}</strong>{label_html}'
+        else:
+            phone_html = '<span style="color:#aaa;font-style:italic">None</span>'
         location = f"{lead['state']} · {lead['county']}"
         top_rows += (
             f'<tr>'

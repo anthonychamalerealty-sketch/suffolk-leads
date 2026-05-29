@@ -159,6 +159,7 @@ Extract these exact fields and return ONLY valid JSON — no markdown, no other 
   "date_of_death": "",
   "petitioner_name": "",
   "petitioner_address": "",
+  "petitioner_phone": "",
   "petitioner_relationship": "",
   "died_intestate": true,
   "heirs": [
@@ -168,6 +169,7 @@ Extract these exact fields and return ONLY valid JSON — no markdown, no other 
 
 Rules:
 - Use null for any field that is blank or illegible.
+- petitioner_phone: look for any telephone/phone number field near the petitioner section.
 - died_intestate: true if the decedent died without a will, false if a will exists.
 - heirs: include all named heirs/distributees with their addresses and relationships.
 - Return ONLY the JSON object, nothing else.
@@ -871,18 +873,25 @@ class GeorgiaProbateScraper(BaseScraper):
 
                 contacts_saved = 0
 
-                # Save petitioner as contact
+                # Save petitioner as contact — source='petition_document' marks
+                # this as the highest-quality phone (petitioner wrote it themselves)
                 petitioner_name = doc_data.get("petitioner_name")
+                petitioner_phone = doc_data.get("petitioner_phone")
                 if petitioner_name:
                     db.add(Contact(
                         lead_id=lead.id,
                         owner_name=petitioner_name,
-                        phone=None,
+                        phone=petitioner_phone,
                         email=None,
-                        source="probate",
+                        source="petition_document",
                     ))
                     contacts_saved += 1
-                    print(f"[probate_ga]   CONTACT (petitioner): {petitioner_name} ({doc_data.get('petitioner_relationship', '')})", flush=True)
+                    print(
+                        f"[probate_ga]   CONTACT (petition_document): {petitioner_name} "
+                        f"| phone={petitioner_phone or 'none'} "
+                        f"| rel={doc_data.get('petitioner_relationship', '')}",
+                        flush=True,
+                    )
 
                 # Save all heirs as contacts
                 for heir in (doc_data.get("heirs") or []):

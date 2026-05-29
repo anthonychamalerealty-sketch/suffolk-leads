@@ -865,17 +865,25 @@ class ProbateScraper(BaseScraper):
                 db.add(lead)
                 db.flush()
 
-                # Save petitioner as contact
+                # Save petitioner as contact — source='petition_document' marks
+                # this as the highest-quality phone (petitioner wrote it themselves)
                 petitioner_name = pdf_data.get("petitioner_name")
+                petitioner_phone = pdf_data.get("petitioner_phone")
                 if petitioner_name:
                     contact = Contact(
                         lead_id=lead.id,
                         owner_name=petitioner_name,
-                        phone=pdf_data.get("petitioner_phone"),
+                        phone=petitioner_phone,
                         email=None,
-                        source="probate",
+                        source="petition_document",
                     )
                     db.add(contact)
+                    print(
+                        f"[probate]   CONTACT (petition_document): {petitioner_name} "
+                        f"| phone={petitioner_phone or 'none'} "
+                        f"| rel={pdf_data.get('petitioner_relationship', '')}",
+                        flush=True,
+                    )
 
                 db.commit()
                 print(f"[probate]   SAVED: lead id={lead.id} | {decedent_addr}", flush=True)
