@@ -5,10 +5,11 @@ Orchestrates and runs all scrapers and pipeline jobs in sequence:
   1. scrapers/parcel_access.py
   2. scrapers/fire_reports.py
   3. scrapers/probate.py
-  4. scrapers/obituary.py
-  5. scrapers/social_signals.py
-  6. processor/enrich.py
-  7. jobs/daily_digest.py
+  4. scrapers/probate_georgia.py
+  5. scrapers/obituary.py
+  6. scrapers/social_signals.py
+  7. processor/enrich.py
+  8. jobs/daily_digest.py
 
 Every step is wrapped in try/except so errors are always printed to stdout
 and never silently swallowed.  All subprocess stdout/stderr is captured and
@@ -186,6 +187,7 @@ def main() -> None:
         "scrapers/parcel_access.py",
         "scrapers/fire_reports.py",
         "scrapers/probate.py",
+        "scrapers/probate_georgia.py",
         "scrapers/obituary.py",
         "scrapers/social_signals.py",
         "processor/enrich.py",
