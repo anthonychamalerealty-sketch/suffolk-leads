@@ -817,7 +817,7 @@ class GeorgiaProbateScraper(BaseScraper):
                 if case_num:
                     existing = db.query(Lead).filter(
                         Lead.source == "probate",
-                        Lead.raw_data.contains(case_num)
+                        Lead.raw_data.like(f"%{case_num}%")
                     ).first()
                     if existing:
                         print(f"[probate_ga]   DUPLICATE: {case_num} (lead id={existing.id})", flush=True)
@@ -935,9 +935,10 @@ class GeorgiaProbateScraper(BaseScraper):
                 if case_num:
                     existing = db.query(Lead).filter(
                         Lead.source == "probate",
-                        Lead.raw_data.contains(case_num)
+                        Lead.raw_data.like(f"%{case_num}%")
                     ).first()
                     if existing:
+                        print(f"[probate_ga]   DUPLICATE (no doc): {case_num}", flush=True)
                         return 0
 
                 county = case.get("county", "")

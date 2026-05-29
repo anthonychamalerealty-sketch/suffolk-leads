@@ -35,12 +35,20 @@ import json
 import logging
 import datetime
 import re
+import time
+import traceback as _traceback
 try:
     import requests
     from bs4 import BeautifulSoup
 except ImportError as _e:
     print(f"[obituary] IMPORT ERROR (requests/bs4): {_e} — install with: pip install requests beautifulsoup4", flush=True)
     raise
+
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as _PWTimeout
+    _PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    _PLAYWRIGHT_AVAILABLE = False
 
 # Ensure project root is on sys.path so database imports work
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -549,6 +557,132 @@ class ObituaryScraper(BaseScraper):
         return len(shared) >= 2
 
     # ------------------------------------------------------------------
+    # TruePeopleSearch address lookup
+    # ------------------------------------------------------------------
+
+    def _lookup_address_truepeoplesearch(self, name: str, town: str, state: str) -> str:
+        """
+        Search TruePeopleSearch for the deceased person's last known address.
+        Returns a street address string if found, or empty string if not found / blocked.
+        Uses Playwright with a 5-second delay to avoid rate limiting.
+        """
+        if not _PLAYWRIGHT_AVAILABLE:
+            print("[obituary]   TPS: Playwright not available — skipping address lookup", flush=True)
+            return ""
+
+        # Build search URL from name and city/state
+        name_parts = name.strip().split()
+        if len(name_parts) < 2:
+            return ""
+        first = name_parts[0].title()
+        last = name_parts[-1].title()
+        location = f"{town} {state}".strip() if town else state
+        import urllib.parse
+        url = (
+            f"https://www.truepeoplesearch.com/results"
+            f"?name={urllib.parse.quote(first + ' ' + last)}"
+            f"&citystatezip={urllib.parse.quote(location)}"
+        )
+        print(f"[obituary]   TPS lookup: {first} {last} in {location}", flush=True)
+
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-dev-shm-usage",
+                          "--disable-blink-features=AutomationControlled"],
+                )
+                ctx = browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1280, "height": 900},
+                    locale="en-US",
+                )
+                ctx.add_init_script(
+                    "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+                )
+                page = ctx.new_page()
+                time.sleep(5)  # Rate limit delay before each TPS request
+
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                except _PWTimeout:
+                    print("[obituary]   TPS: page load timeout", flush=True)
+                    browser.close()
+                    return ""
+
+                html = page.content()
+
+                # Check for CAPTCHA
+                if any(kw in html.lower() for kw in ["captcha", "robot", "verify you are human", "cf-challenge"]):
+                    print("[obituary]   TPS: CAPTCHA detected — skipping", flush=True)
+                    browser.close()
+                    return ""
+
+                soup = BeautifulSoup(html, "html.parser")
+
+                # Try to find the first result card and click into it
+                result_link = None
+                for a in soup.find_all("a", href=True):
+                    href = a["href"]
+                    if "/find/" in href and "/" in href.replace("/find/", ""):
+                        result_link = href if href.startswith("http") else f"https://www.truepeoplesearch.com{href}"
+                        break
+
+                if not result_link:
+                    print("[obituary]   TPS: no result found for this person", flush=True)
+                    browser.close()
+                    return ""
+
+                # Navigate to the profile page
+                time.sleep(2)
+                try:
+                    page.goto(result_link, wait_until="domcontentloaded", timeout=20000)
+                except _PWTimeout:
+                    print("[obituary]   TPS: profile page timeout", flush=True)
+                    browser.close()
+                    return ""
+
+                profile_html = page.content()
+                browser.close()
+
+                profile_soup = BeautifulSoup(profile_html, "html.parser")
+
+                # Extract the current/most recent address
+                # TruePeopleSearch shows addresses in divs with class 'content-value' or similar
+                address_found = ""
+                for div in profile_soup.find_all(["div", "span", "li"]):
+                    text = div.get_text(separator=" ", strip=True)
+                    # Match patterns like "123 Main St, Huntington, NY 11743"
+                    addr_match = re.search(
+                        r'\d+\s+[A-Za-z0-9 .#,-]+,\s*[A-Za-z ]+,\s*[A-Z]{2}\s+\d{5}',
+                        text
+                    )
+                    if addr_match:
+                        candidate = addr_match.group(0).strip()
+                        # Prefer addresses in the same state
+                        if state.upper() in candidate.upper():
+                            address_found = candidate
+                            break
+                        elif not address_found:
+                            address_found = candidate
+
+                if address_found:
+                    print(f"[obituary]   TPS: found address: {address_found}", flush=True)
+                else:
+                    print("[obituary]   TPS: no address extracted from profile", flush=True)
+
+                return address_found
+
+        except Exception as exc:
+            print(f"[obituary]   TPS: error during lookup: {exc}", flush=True)
+            _traceback.print_exc()
+            return ""
+
+    # ------------------------------------------------------------------
     # Database persistence
     # ------------------------------------------------------------------
 
@@ -606,16 +740,29 @@ class ObituaryScraper(BaseScraper):
                 except Exception as dup_exc:
                     print(f"[obituary]   Dedup check error: {dup_exc}", flush=True)
 
-                # Build address: use property address if matched, else town/state from obit
+                # Build address: use property address if matched, else TruePeopleSearch, else town placeholder
                 town = obit.get("town", "")
                 state = obit.get("state", "NY")
                 county = obit.get("county", "Suffolk")
+                address_confirmed = True
+
                 if matched_prop:
                     address = matched_prop.address
-                elif town:
-                    address = f"{deceased} estate - {town}, {state}"
+                    tps_address = ""
                 else:
-                    address = f"{deceased} estate - {state}"
+                    # Tier 2: Try TruePeopleSearch to find the deceased's last known address
+                    tps_address = self._lookup_address_truepeoplesearch(deceased, town, state)
+                    if tps_address:
+                        address = tps_address
+                        print(f"[obituary]   TPS address found: {tps_address}", flush=True)
+                    elif town:
+                        address = f"{town}, {state}"
+                        address_confirmed = False
+                        print(f"[obituary]   No address found — using town placeholder: {address}", flush=True)
+                    else:
+                        address = f"{state} (address unknown)"
+                        address_confirmed = False
+                        print(f"[obituary]   No address found — using state placeholder", flush=True)
 
                 raw_data = {
                     "deceased_name":    deceased,
@@ -623,15 +770,17 @@ class ObituaryScraper(BaseScraper):
                     "surviving_family": obit.get("surviving_family", []),
                     "published_date":   obit.get("published_date", ""),
                     "source_url":       obit.get("source_url", ""),
-                    "property_address": matched_prop.address if matched_prop else "",
+                    "property_address": matched_prop.address if matched_prop else tps_address,
                     "owner_name":       matched_prop.owner_name if matched_prop else "Unknown - needs lookup",
+                    "address_confirmed": address_confirmed,
+                    "address_source":   "property_match" if matched_prop else ("truepeoplesearch" if tps_address else "town_placeholder"),
                 }
                 lead = Lead(
                     address=address,
                     parcel_id=matched_prop.parcel_id if matched_prop else None,
                     source="obituary",
                     raw_data=json.dumps(raw_data),
-                    score=0.75,
+                    score=0.75 if address_confirmed else 0.50,
                     status="new",
                     state=state,
                     county=county,
@@ -640,11 +789,12 @@ class ObituaryScraper(BaseScraper):
                     db.add(lead)
                     db.flush()
                     saved_count += 1
-                    print(f"[obituary]   SAVED: lead id={lead.id} | {deceased} | {address[:60]} | parcel={lead.parcel_id or 'NULL'}", flush=True)
+                    addr_src = raw_data["address_source"]
+                    print(f"[obituary]   SAVED: lead id={lead.id} | {deceased} | {address[:60]} | addr_src={addr_src} | confirmed={address_confirmed}", flush=True)
                 except Exception as ins_exc:
                     db.rollback()
                     print(f"[obituary]   INSERT ERROR for {deceased}: {ins_exc}", flush=True)
-                    _tb.print_exc()
+                    _traceback.print_exc()
                     continue
 
             db.commit()

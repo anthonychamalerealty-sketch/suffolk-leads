@@ -633,14 +633,21 @@ class ProbateScraper(BaseScraper):
             print(f"[probate]   PDF extraction failed — saving without PDF data", flush=True)
             return self._save_no_pdf(filing, parties)
 
-        # CRITICAL FILTER: skip if no real property
-        if not pdf_data.get("has_real_property", True):
-            raw_val = pdf_data.get("real_property_value_raw", "blank/0")
-            print(f"[probate]   SKIPPED: section 3(b) = '{raw_val}' — no real property", flush=True)
+        # CRITICAL FILTER: skip ONLY when GPT-4o explicitly confirmed $0/NONE AND value=0
+        # If has_real_property is missing or ambiguous, save anyway — never lose a real case
+        prop_dollars = pdf_data.get("real_property_value_dollars", None)
+        has_prop = pdf_data.get("has_real_property", None)  # None = GPT-4o didn't say
+        raw_val = pdf_data.get("real_property_value_raw", "")
+        print(f"[probate]   Section 3(b): has_real_property={has_prop} | raw='{raw_val}' | dollars={prop_dollars}", flush=True)
+
+        if has_prop is False and (prop_dollars == 0 or prop_dollars is None):
+            # GPT-4o explicitly said no real property and gave $0 or blank
+            print(f"[probate]   SKIPPED (confirmed no real property): section 3(b) = '{raw_val}'", flush=True)
             return False
 
-        prop_val = pdf_data.get("real_property_value_dollars")
-        print(f"[probate]   Section 3(b) real property: ${prop_val:,}" if prop_val else "[probate]   Section 3(b): value present", flush=True)
+        if has_prop is False and prop_dollars:
+            # GPT-4o said false but gave a dollar value — trust the value, save it
+            print(f"[probate]   WARNING: has_real_property=false but value=${prop_dollars} — saving anyway", flush=True)
 
         return self._save_lead(filing, parties, pdf_data, pdf_url)
 
@@ -931,7 +938,7 @@ class ProbateScraper(BaseScraper):
                     "file_number":   filing["file_number"],
                     "file_date":     filing["file_date"],
                     "proceeding":    filing["proceeding"],
-                    "case_url":      filing["history_url"],
+                    "case_url":      filing.get("history_url") or filing.get("case_url", ""),
                     "decedent_name": name,
                     "date_of_death": filing.get("dod", ""),
                     "parties":       parties,
