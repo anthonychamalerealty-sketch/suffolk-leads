@@ -1,50 +1,55 @@
 """
 probate.py
 ----------
-Scrapes probate court filings for Suffolk County, NY using Playwright
-to automate the NYSCEF (NY State Courts Electronic Filing System) name-search
-portal at:
-  https://iapps.courts.state.ny.us/nyscef/CaseSearch?TAB=name
+Scrapes real probate/administration petition filings from WebSurrogates
+(websurrogates.nycourts.gov) — Suffolk County Surrogate's Court.
 
-Also scrapes six Georgia counties using their public probate court portals.
+EXACT FLOW (matches screenshots provided):
+==========================================
+Step 1 — Navigate to https://websurrogates.nycourts.gov/File/FileSearch
+  - First pass through the Welcome page to get a valid session cookie.
+  - Select Court = "Suffolk County Surrogate's Court"
+  - Run two File Information Searches (last 7 days):
+      • File Proceeding = ADMINISTRATION PETITION
+      • File Proceeding = PROBATE PETITION
 
-NOTE ON CLOUDFLARE PROTECTION
-------------------------------
-Both websurrogates.nycourts.gov and iapps.courts.state.ny.us are protected
-by a Cloudflare managed challenge that cannot be solved from a data-center IP
-address (such as Railway's servers).  The scraper handles this gracefully:
+Step 2 — Results table (/File/FileSearchResults)
+  - Extract from every row: File #, File Date, File Name (decedent), Proceeding, DOD
+  - Click each File # link
 
-  1. It attempts the live scrape with Playwright + stealth settings.
-  2. If the Cloudflare challenge page is detected, it logs a clear error and
-     falls back to the most recent mock filings so the pipeline always produces
-     leads.
-  3. You can bypass Cloudflare by exporting your browser cookies to a JSON file
-     and passing --cookie-file /path/to/cookies.json on the CLI, or by setting
-     the NYSCEF_COOKIE_FILE environment variable.  Use the EditThisCookie Chrome
-     extension or browser DevTools → Application → Cookies → Export.
+Step 3 — File History page (/File/FileHistory)
+  - Extract all parties and their roles (DECEDENT, ADMINISTRATOR, EXECUTOR)
+  - Find and click the ADMINISTRATION PETITION or PROBATE PETITION document link
 
-LEAD SAVING BEHAVIOUR
+Step 4 — PDF reading with GPT-4o vision
+  - Convert PDF pages 1 and 2 to images (200 DPI)
+  - Page 1: extract petitioner name/address/phone/relationship + decedent name/address/township/DOD
+  - Page 2: extract section 3(b) real property value
+  - CRITICAL FILTER: if 3(b) = $0, blank, crossed out, or NONE → skip this lead
+
+Step 5 — Save to database
+  - leads:    address = decedent address, source='probate', parcel_id=NULL
+  - contacts: petitioner name, phone, source='probate'
+  - raw_data: file_number, case_url, pdf_url, DOD, real property value, township,
+              petitioner address, petitioner relationship
+
+CLOUDFLARE / IP BLOCK
 ---------------------
-Every filing is saved to the leads table regardless of whether a matching
-property record exists in the properties table.  Unmatched leads have:
-  - parcel_id  = NULL
-  - address    = decedent name + county (best available)
-  - raw_data   = JSON with case_number, case_url, petitioner_name, case_type,
-                 decedent_name, filing_date
+websurrogates.nycourts.gov blocks data-center IPs at the WAF layer.
+Set WEBSURROGATES_COOKIE_FILE or WEBSURROGATES_COOKIES_JSON to inject
+real browser cookies (export with EditThisCookie Chrome extension).
+Without cookies, the scraper logs a clear error and saves 0 leads.
+NO MOCK DATA IS USED — only real records from the website are saved.
 
-Case types scraped (NY):
-  - Probate
-  - Administration
-
-Usage:
-  python scrapers/probate.py
-  python scrapers/probate.py --cookie-file /path/to/cookies.json
-  from scrapers.probate import ProbateScraper; ProbateScraper().scrape()
+Georgia counties:
+  Fulton, Gwinnett, Cobb, DeKalb, Chatham, Clarke — scraped via HTTP.
 """
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime
+import io
 import json
 import logging
 import os
@@ -52,218 +57,184 @@ import re
 import sys
 import time
 import traceback
+from typing import Optional
 
 # ── Guarded third-party imports ───────────────────────────────────────────────
 try:
     import requests
     from bs4 import BeautifulSoup
 except ImportError as _e:
-    print(f"[probate] IMPORT ERROR (requests/bs4): {_e} — install with: pip install requests beautifulsoup4", flush=True)
+    print(f"[probate] IMPORT ERROR (requests/bs4): {_e}", flush=True)
     raise
 
 try:
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
     _PLAYWRIGHT_AVAILABLE = True
 except ImportError as _e:
-    print(f"[probate] WARNING: playwright not installed — live scraping disabled: {_e}", flush=True)
+    print(f"[probate] WARNING: playwright not installed: {_e}", flush=True)
     _PLAYWRIGHT_AVAILABLE = False
 
-# Ensure project root is on sys.path so database imports work
+try:
+    from pdf2image import convert_from_bytes
+    _PDF2IMAGE_AVAILABLE = True
+except ImportError as _e:
+    print(f"[probate] WARNING: pdf2image not installed: {_e}", flush=True)
+    _PDF2IMAGE_AVAILABLE = False
+
+try:
+    from openai import OpenAI as _OpenAI
+    _OPENAI_AVAILABLE = True
+except ImportError as _e:
+    print(f"[probate] WARNING: openai not installed: {_e}", flush=True)
+    _OPENAI_AVAILABLE = False
+
+# ── Project root on sys.path ──────────────────────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 try:
-    from database import SessionLocal, Property, Lead
+    from database import SessionLocal, Property, Lead, Contact
+    _DB_AVAILABLE = True
 except Exception as _e:
     print(f"[probate] IMPORT ERROR (database): {_e}", flush=True)
     traceback.print_exc()
-    raise
+    SessionLocal = Property = Lead = Contact = None
+    _DB_AVAILABLE = False
 
-from scrapers.base_scraper import BaseScraper
+try:
+    from scrapers.base_scraper import BaseScraper
+except Exception:
+    class BaseScraper:
+        def scrape(self): pass
 
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    format="%(asctime)s [probate] %(message)s",
+    datefmt="%H:%M:%S",
 )
-logger = logging.getLogger("ProbateScraper")
+logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Constants
-# ─────────────────────────────────────────────────────────────────────────────
-NYSCEF_BASE = "https://iapps.courts.state.ny.us/nyscef"
-NYSCEF_SEARCH_URL = f"{NYSCEF_BASE}/CaseSearch?TAB=name"
+# ── Constants ─────────────────────────────────────────────────────────────────
+BASE_URL      = "https://websurrogates.nycourts.gov"
+WELCOME_URL   = f"{BASE_URL}/Home/Welcome/?ReturnUrl=%2FFile%2FFileSearch"
+FILE_SEARCH   = f"{BASE_URL}/File/FileSearch"
+PROCEEDINGS   = ["ADMINISTRATION PETITION", "PROBATE PETITION"]
+REQUEST_DELAY = 3   # seconds between requests
+GPT_MODEL     = "gpt-4o"
 
-# Suffolk County value in the NYSCEF county dropdown (verified by probe)
-NYSCEF_SUFFOLK_VALUE = "52"
-
-# NYSCEF case type values (obfuscated by the site — verified by probe)
-NYSCEF_CASE_TYPES: dict[str, str] = {
-    "Probate":        "ZXL47MVGiXTShahJS1u1Sw==",
-    "Administration": "sTShoYfmvVprI_PLUS_4gtFBwQA==",
+# Georgia probate court portals
+GA_PROBATE_COURTS: dict[str, str] = {
+    "Fulton":  "https://www.fultonprobate.org/",
+    "Gwinnett": "https://www.gwinnettcourts.com/probate/",
+    "Cobb":    "https://www.cobbcounty.org/courts/probate",
+    "DeKalb":  "https://www.dekalbcountyga.gov/probate-court",
+    "Chatham": "https://www.chathamcounty.org/Offices/Probate-Court",
+    "Clarke":  "https://www.accgov.com/probate",
 }
 
-# How many days back to search
-LOOKBACK_DAYS = 7
+# ── GPT-4o prompts ────────────────────────────────────────────────────────────
+_PAGE1_PROMPT = """
+You are reading page 1 of a New York Surrogate's Court petition form (handwritten or typed).
+Extract the following fields exactly as written. Return ONLY a JSON object, no other text.
 
-# Polite delay between requests (seconds)
-REQUEST_DELAY = 3
-
-# Georgia probate court portal configurations
-GA_PROBATE_COURTS: dict[str, dict] = {
-    "Fulton": {
-        "url": "https://www.fultonprobate.org/",
-        "search_url": "https://www.fultonprobate.org/case-search",
-        "state": "GA",
-    },
-    "Gwinnett": {
-        "url": "https://www.gwinnettcourts.com/probate/",
-        "search_url": "https://www.gwinnettcourts.com/probate/case-search",
-        "state": "GA",
-    },
-    "Cobb": {
-        "url": "https://www.cobbcounty.org/courts/probate",
-        "search_url": "https://www.cobbcounty.org/courts/probate/case-search",
-        "state": "GA",
-    },
-    "DeKalb": {
-        "url": "https://www.dekalbcountyga.gov/probate-court",
-        "search_url": "https://www.dekalbcountyga.gov/probate-court/case-search",
-        "state": "GA",
-    },
-    "Chatham": {
-        "url": "https://www.chathamcounty.org/Offices/Probate-Court",
-        "search_url": "https://www.chathamcounty.org/Offices/Probate-Court/Case-Search",
-        "state": "GA",
-    },
-    "Clarke": {
-        "url": "https://www.accgov.com/probate",
-        "search_url": "https://www.accgov.com/probate/case-search",
-        "state": "GA",
-    },
+{
+  "petitioner_name": "...",
+  "petitioner_street": "...",
+  "petitioner_city_town": "...",
+  "petitioner_state": "...",
+  "petitioner_zip": "...",
+  "petitioner_county": "...",
+  "petitioner_phone": "...",
+  "petitioner_relationship": "...",
+  "decedent_name": "...",
+  "decedent_street": "...",
+  "decedent_city_town": "...",
+  "decedent_state": "...",
+  "decedent_zip": "...",
+  "township": "...",
+  "county": "...",
+  "date_of_death": "...",
+  "place_of_death": "..."
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Scraper class
-# ─────────────────────────────────────────────────────────────────────────────
+Notes:
+- Section 1 = petitioner (administrator/executor). Section 2 = decedent.
+- Domicile field layout: Street Address | City/Town/Village | State | Zip Code
+- Telephone Number is on the right side of the state/zip line in Section 1
+- Interest of Petitioner = relationship (Wife, Son, Daughter, etc.)
+- Use null for any field that is blank or illegible.
+""".strip()
 
+_PAGE2_PROMPT = """
+You are reading page 2 of a New York Surrogate's Court petition form.
+Find section 3(b): "The estimated gross value of the decedent's real property, in this state".
+Look for the dollar amount written after the $ sign on that line.
+
+Return ONLY this JSON object:
+{
+  "real_property_value_raw": "...",
+  "real_property_value_dollars": <number or null>,
+  "has_real_property": <true or false>
+}
+
+Rules:
+- If the amount is $0, blank, crossed out, "NONE", "N/A", or not filled → has_real_property=false, real_property_value_dollars=0
+- If there is a real dollar amount (e.g. 50,000 or 500000) → has_real_property=true
+- Strip commas and dollar signs when setting real_property_value_dollars
+- Return ONLY the JSON, no other text.
+""".strip()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 class ProbateScraper(BaseScraper):
     """
-    Scrapes probate court filings for Suffolk County (NY) via NYSCEF and six
-    Georgia counties via their public court portals.
-
-    Every filing is saved to the leads table regardless of whether a matching
-    property record exists.  Unmatched leads have parcel_id=NULL.
+    Scrapes WebSurrogates File Search for Suffolk County probate filings,
+    reads petition PDFs with GPT-4o vision, and saves leads to the database.
+    No mock data — only real records are saved.
     """
 
-    def __init__(self, cookie_file: str | None = None):
-        """
-        Parameters
-        ----------
-        cookie_file : str | None
-            Path to a JSON file containing browser cookies exported from a
-            real browser session.  Used to bypass Cloudflare on NYSCEF.
-            Overrides the NYSCEF_COOKIE_FILE environment variable.
-        """
-        self.cookie_file = cookie_file or os.environ.get("NYSCEF_COOKIE_FILE")
-        self.http_headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-        }
+    def __init__(self, cookie_file: Optional[str] = None, days: int = 7):
+        self.cookie_file = (
+            cookie_file
+            or os.getenv("WEBSURROGATES_COOKIE_FILE", "")
+        )
+        self.days = days
+        self._openai: Optional[_OpenAI] = None
+        self._session_cookies: list[dict] = []
+        self._blocked = False
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Public API
-    # ─────────────────────────────────────────────────────────────────────────
-
+    # ── Public entry point ────────────────────────────────────────────────────
     def scrape(self) -> list[dict]:
-        """
-        Main entry point.  Scrapes probate filings from Suffolk County (NY)
-        and all six Georgia counties.  Saves every filing to the leads table
-        with parcel_id=NULL for unmatched records.
+        """Run the full scrape. Returns list of filing dicts that were saved."""
+        print("[probate] ============================================================", flush=True)
+        print("[probate] STARTING PROBATE SCRAPER — WebSurrogates File Search", flush=True)
+        print(f"[probate] Date range: last {self.days} days", flush=True)
+        print(f"[probate] Playwright:  {_PLAYWRIGHT_AVAILABLE}", flush=True)
+        print(f"[probate] pdf2image:   {_PDF2IMAGE_AVAILABLE}", flush=True)
+        print(f"[probate] OpenAI:      {_OPENAI_AVAILABLE}", flush=True)
+        print(f"[probate] Database:    {_DB_AVAILABLE}", flush=True)
+        print(f"[probate] Cookie file: {self.cookie_file or '(none set)'}", flush=True)
 
-        Returns a combined list of all raw filing dicts.
-        """
-        print("[probate] Starting probate filings scraping (NY + GA)…", flush=True)
-        logger.info("Starting probate filings scraping (NY + GA)…")
-        all_filings: list[dict] = []
-
-        # ── New York: Suffolk County via NYSCEF ───────────────────────────────
-        print("[probate] Scraping Suffolk County (NY) via NYSCEF…", flush=True)
-        logger.info("Scraping Suffolk County (NY) via NYSCEF…")
-        ny_filings = self._scrape_nyscef_playwright()
-        if not ny_filings:
-            print(
-                "[probate] NYSCEF live scrape returned 0 results "
-                "(likely Cloudflare challenge from this IP). "
-                "Using mock NY filings. "
-                "To use real data: set NYSCEF_COOKIE_FILE=/path/to/cookies.json",
-                flush=True,
-            )
-            logger.warning(
-                "NYSCEF live scrape returned 0 results (Cloudflare or no data). "
-                "Falling back to mock filings."
-            )
-            ny_filings = self._get_mock_filings(state="NY", county="Suffolk")
-        all_filings.extend(ny_filings)
-        print(f"[probate] Suffolk County (NY): {len(ny_filings)} filing(s).", flush=True)
-        logger.info("Suffolk County (NY): %d filing(s).", len(ny_filings))
-
-        # ── Georgia counties ──────────────────────────────────────────────────
-        for county, cfg in GA_PROBATE_COURTS.items():
-            print(f"[probate] Scraping {county} County (GA)…", flush=True)
-            logger.info("Scraping %s County (GA) probate filings…", county)
-            ga_filings = self._scrape_ga_probate(county, cfg)
-            if not ga_filings:
-                print(
-                    f"[probate] {county} County GA live scrape returned 0 results — using mock filings.",
-                    flush=True,
-                )
-                logger.info("Live scrape failed for %s County GA — using mock filings.", county)
-                ga_filings = self._get_mock_filings(state="GA", county=county)
-            all_filings.extend(ga_filings)
-            print(f"[probate] {county} County (GA): {len(ga_filings)} filing(s).", flush=True)
-            logger.info("%s County (GA): %d filing(s).", county, len(ga_filings))
-            time.sleep(REQUEST_DELAY)
-
-        print(f"[probate] Total filings collected: {len(all_filings)}", flush=True)
-        logger.info("Total probate filings collected: %d", len(all_filings))
-
-        saved = self._save_leads(all_filings)
-        print(f"[probate] New leads saved: {saved}", flush=True)
-        logger.info("New leads saved: %d", saved)
-        return all_filings
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # NYSCEF Playwright scraper
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _scrape_nyscef_playwright(self) -> list[dict]:
-        """
-        Uses Playwright headless Chromium to automate the NYSCEF name-search
-        form for Suffolk County Probate and Administration filings from the
-        last LOOKBACK_DAYS days.
-
-        Cloudflare detection:
-          - If the page title is "Just a moment..." after load, the challenge
-            is active and the method returns [] immediately with a clear log.
-          - If a cookie_file is provided, those cookies are injected before
-            navigation to bypass the challenge.
-
-        Returns a list of filing dicts or [] on failure.
-        """
         if not _PLAYWRIGHT_AVAILABLE:
-            print("[probate] Playwright not available — skipping live NYSCEF scrape.", flush=True)
+            print("[probate] ERROR: playwright required. Run: pip install playwright && playwright install chromium", flush=True)
             return []
 
-        filings: list[dict] = []
-        today = datetime.date.today()
-        start_date = today - datetime.timedelta(days=LOOKBACK_DAYS)
+        # Initialise OpenAI
+        if _OPENAI_AVAILABLE:
+            try:
+                self._openai = _OpenAI()
+                print("[probate] OpenAI client ready.", flush=True)
+            except Exception as exc:
+                print(f"[probate] WARNING: OpenAI init failed: {exc}", flush=True)
+
+        # Load cookies
+        self._load_cookies()
+
+        saved_filings: list[dict] = []
+        total_saved = 0
 
         try:
             with sync_playwright() as pw:
@@ -284,546 +255,819 @@ class ProbateScraper(BaseScraper):
                     viewport={"width": 1280, "height": 900},
                     locale="en-US",
                     timezone_id="America/New_York",
-                    extra_http_headers={
-                        "Accept-Language": "en-US,en;q=0.9",
-                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    },
                 )
-
-                # Inject cookies if provided (bypasses Cloudflare)
-                if self.cookie_file and os.path.isfile(self.cookie_file):
-                    print(f"[probate] Loading cookies from {self.cookie_file}", flush=True)
-                    try:
-                        with open(self.cookie_file) as cf:
-                            cookies = json.load(cf)
-                        ctx.add_cookies(cookies)
-                        print(f"[probate] Injected {len(cookies)} cookie(s).", flush=True)
-                    except Exception as ce:
-                        print(f"[probate] Failed to load cookies: {ce}", flush=True)
+                ctx.add_init_script(
+                    "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+                    "window.chrome={runtime:{}};"
+                )
+                if self._session_cookies:
+                    ctx.add_cookies(self._session_cookies)
+                    print(f"[probate] Injected {len(self._session_cookies)} cookies.", flush=True)
 
                 page = ctx.new_page()
 
-                # Mask automation fingerprint
-                page.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                    Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
-                    Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-                    window.chrome = {runtime: {}};
-                """)
+                # Step 1: Pass through Welcome page to get session
+                if not self._pass_welcome(page):
+                    browser.close()
+                    print("[probate] Could not pass Welcome page — aborting.", flush=True)
+                    return []
 
-                for case_type_name, case_type_val in NYSCEF_CASE_TYPES.items():
-                    print(
-                        f"[probate] NYSCEF search: Suffolk County / {case_type_name} / "
-                        f"{start_date} to {today}",
-                        flush=True,
-                    )
-                    logger.info(
-                        "NYSCEF search: Suffolk County / %s / %s to %s",
-                        case_type_name, start_date, today,
-                    )
+                # Step 2: Run File Information Search for each proceeding type
+                date_from, date_to = self._date_range()
+                print(f"[probate] Search date range: {date_from} → {date_to}", flush=True)
 
+                all_filings: list[dict] = []
+                for proceeding in PROCEEDINGS:
+                    rows = self._search_filings(page, proceeding, date_from, date_to)
+                    print(f"[probate] {proceeding}: {len(rows)} results", flush=True)
+                    all_filings.extend(rows)
+
+                print(f"[probate] Total filings to process: {len(all_filings)}", flush=True)
+
+                # Steps 3–5: Process each filing
+                for i, filing in enumerate(all_filings, 1):
+                    print(f"\n[probate] [{i}/{len(all_filings)}] {filing['file_number']} — {filing['decedent_name']}", flush=True)
                     try:
-                        page.goto(
-                            NYSCEF_SEARCH_URL,
-                            wait_until="domcontentloaded",
-                            timeout=30000,
-                        )
-                        time.sleep(REQUEST_DELAY)
-
-                        # Detect Cloudflare challenge
-                        title = page.title()
-                        if "just a moment" in title.lower():
-                            print(
-                                "[probate] CLOUDFLARE CHALLENGE DETECTED on NYSCEF. "
-                                "This IP is blocked. "
-                                "To fix: export cookies from a real browser session and set "
-                                "NYSCEF_COOKIE_FILE=/path/to/cookies.json",
-                                flush=True,
-                            )
-                            logger.warning(
-                                "Cloudflare challenge detected on NYSCEF — "
-                                "live scraping not possible from this IP."
-                            )
-                            browser.close()
-                            return []
-
-                        # Select party name radio button
-                        party_radio = page.query_selector("input[id='partyName']")
-                        if party_radio:
-                            party_radio.click()
-                            time.sleep(0.5)
-
-                        # Fill last name (broad search — we filter by case type and date)
-                        last_inp = page.query_selector("input[name='txtPartyLastName']")
-                        if last_inp:
-                            last_inp.fill("A")  # single letter = broad search
-
-                        # Select Suffolk County
-                        county_sel = page.query_selector("select[name='txtCounty']")
-                        if county_sel:
-                            county_sel.select_option(value=NYSCEF_SUFFOLK_VALUE)
-
-                        # Select case type
-                        ct_sel = page.query_selector("select[name='txtCaseType']")
-                        if ct_sel:
-                            ct_sel.select_option(value=case_type_val)
-
-                        # Set date range
-                        date_from_inp = page.query_selector("input[name='txtFilingDateFrom']")
-                        date_to_inp = page.query_selector("input[name='txtFilingDateTo']")
-                        if date_from_inp:
-                            date_from_inp.fill(start_date.strftime("%m/%d/%Y"))
-                        if date_to_inp:
-                            date_to_inp.fill(today.strftime("%m/%d/%Y"))
-
-                        # Submit
-                        submit_btn = page.query_selector("input[type='submit']")
-                        if not submit_btn:
-                            submit_btn = page.query_selector("button[type='submit']")
-                        if submit_btn:
-                            submit_btn.click()
-
-                        # Wait for AJAX results to load
-                        try:
-                            page.wait_for_function(
-                                "() => !document.body.innerText.includes('Request in progress')",
-                                timeout=25000,
-                            )
-                        except PWTimeout:
-                            logger.warning("Timed out waiting for NYSCEF results for %s.", case_type_name)
-
-                        time.sleep(REQUEST_DELAY)
-
-                        # Parse results table
-                        new_filings = self._parse_nyscef_results(page, case_type_name)
-                        print(
-                            f"[probate] NYSCEF {case_type_name}: {len(new_filings)} filing(s) found.",
-                            flush=True,
-                        )
-                        logger.info("NYSCEF %s: %d filing(s).", case_type_name, len(new_filings))
-                        filings.extend(new_filings)
-
-                    except PWTimeout as te:
-                        logger.warning("Playwright timeout for %s: %s", case_type_name, te)
+                        saved = self._process_filing(page, filing)
+                        if saved:
+                            total_saved += 1
+                            saved_filings.append(filing)
+                            print(f"[probate]   → LEAD SAVED", flush=True)
+                        else:
+                            print(f"[probate]   → SKIPPED", flush=True)
                     except Exception as exc:
-                        logger.warning("NYSCEF scrape failed for %s: %s", case_type_name, exc)
+                        print(f"[probate]   → ERROR: {exc}", flush=True)
                         traceback.print_exc()
+                    time.sleep(REQUEST_DELAY)
 
                 browser.close()
 
         except Exception as exc:
-            print(f"[probate] Playwright session failed: {exc}", flush=True)
-            logger.error("Playwright session failed: %s", exc)
+            print(f"[probate] FATAL ERROR: {exc}", flush=True)
             traceback.print_exc()
 
-        return filings
+        # Georgia counties
+        print("\n[probate] === Georgia Counties ===", flush=True)
+        ga_total = self._scrape_georgia()
+        total_saved += ga_total
 
-    def _parse_nyscef_results(self, page, case_type_name: str) -> list[dict]:
-        """
-        Parses the NYSCEF results table from the current Playwright page.
+        print(f"\n[probate] DONE. Total leads saved: {total_saved}", flush=True)
+        return saved_filings
 
-        Extracts for each row:
-          - decedent_name   : party name from the filing
-          - filing_date     : date filed
-          - case_number     : NYSCEF index number
-          - petitioner_name : petitioner / attorney name (if visible)
-          - case_type       : the case type searched
-          - case_url        : direct link to the case on NYSCEF
-          - state           : "NY"
-          - county          : "Suffolk"
-        """
-        filings: list[dict] = []
+    # ── Cookie loading ────────────────────────────────────────────────────────
+    def _load_cookies(self):
+        cookies_json = os.getenv("WEBSURROGATES_COOKIES_JSON", "")
+        if not cookies_json and self.cookie_file and os.path.exists(self.cookie_file):
+            try:
+                with open(self.cookie_file) as f:
+                    cookies_json = f.read()
+                print(f"[probate] Loaded cookies from: {self.cookie_file}", flush=True)
+            except Exception as exc:
+                print(f"[probate] WARNING: Could not read cookie file: {exc}", flush=True)
+        if cookies_json:
+            try:
+                raw = json.loads(cookies_json)
+                normalised = []
+                for c in raw:
+                    entry = {
+                        "name":   c.get("name", ""),
+                        "value":  c.get("value", ""),
+                        "domain": c.get("domain", ".websurrogates.nycourts.gov"),
+                        "path":   c.get("path", "/"),
+                    }
+                    for k in ("httpOnly", "secure", "sameSite"):
+                        if k in c:
+                            entry[k] = c[k]
+                    normalised.append(entry)
+                self._session_cookies = normalised
+                print(f"[probate] Parsed {len(normalised)} cookies.", flush=True)
+            except Exception as exc:
+                print(f"[probate] WARNING: Could not parse cookies: {exc}", flush=True)
+
+    # ── Welcome page pass-through ─────────────────────────────────────────────
+    def _pass_welcome(self, page) -> bool:
+        """Navigate through the Welcome page to get a valid session cookie."""
+        print("[probate] Loading Welcome page...", flush=True)
         try:
-            tables = page.query_selector_all("table")
-            if not tables:
-                logger.debug("No result tables found on NYSCEF results page.")
-                return filings
+            page.goto(WELCOME_URL, wait_until="domcontentloaded", timeout=30000)
+        except PWTimeout:
+            print("[probate] ERROR: Timeout on Welcome page.", flush=True)
+            return False
+        time.sleep(REQUEST_DELAY)
 
-            for table in tables:
-                rows = table.query_selector_all("tr")
-                if len(rows) < 2:
-                    continue
+        if self._is_blocked(page):
+            self._log_block()
+            return False
 
-                # Detect header row to map column indices
-                header_cells = rows[0].query_selector_all("th, td")
-                headers = [c.inner_text().strip().lower() for c in header_cells]
-                logger.debug("NYSCEF table headers: %s", headers)
+        print(f"[probate] Welcome page loaded: {page.title()}", flush=True)
 
-                # Map column names to indices
-                col = {}
-                for i, h in enumerate(headers):
-                    if "name" in h and "party" in h:
-                        col["name"] = i
-                    elif "index" in h or "case" in h or "number" in h:
-                        col["case_number"] = i
-                    elif "date" in h and "fil" in h:
-                        col["filing_date"] = i
-                    elif "type" in h:
-                        col["case_type"] = i
-                    elif "petitioner" in h or "attorney" in h:
-                        col["petitioner"] = i
+        # Click "Start Search" to get the session cookie
+        btn = page.query_selector(
+            "button#StartSearchButton, input[value='Start Search'], "
+            "button:has-text('Start Search'), a:has-text('Start Search')"
+        )
+        if btn:
+            print("[probate] Clicking 'Start Search'...", flush=True)
+            btn.click()
+            time.sleep(REQUEST_DELAY)
+            if self._is_blocked(page):
+                self._log_block()
+                return False
+            print(f"[probate] After click: {page.title()} | {page.url}", flush=True)
+        else:
+            print("[probate] 'Start Search' button not found — proceeding directly.", flush=True)
 
-                # If we couldn't map columns, use positional defaults
-                if not col:
-                    col = {"name": 0, "case_number": 1, "filing_date": 2}
-
-                for row in rows[1:]:
-                    cells = row.query_selector_all("td")
-                    if not cells:
-                        continue
-                    cell_texts = [c.inner_text().strip() for c in cells]
-                    if not any(cell_texts):
-                        continue
-
-                    def _get(key: str, default: str = "") -> str:
-                        idx = col.get(key)
-                        if idx is not None and idx < len(cell_texts):
-                            return cell_texts[idx]
-                        return default
-
-                    # Extract case URL from any link in the row
-                    links = row.query_selector_all("a")
-                    case_url = ""
-                    case_number = _get("case_number")
-                    for lnk in links:
-                        href = lnk.get_attribute("href") or ""
-                        if href and ("case" in href.lower() or "index" in href.lower() or "nyscef" in href.lower()):
-                            case_url = href if href.startswith("http") else f"{NYSCEF_BASE}/{href.lstrip('/')}"
-                            if not case_number:
-                                case_number = lnk.inner_text().strip()
-                            break
-                    if not case_url and links:
-                        href = links[0].get_attribute("href") or ""
-                        case_url = href if href.startswith("http") else f"{NYSCEF_BASE}/{href.lstrip('/')}"
-
-                    decedent_name = _get("name") or cell_texts[0] if cell_texts else "Unknown"
-                    filing_date = self._normalise_date(_get("filing_date"))
-                    petitioner_name = _get("petitioner", "Unknown")
-
-                    if not decedent_name or decedent_name.lower() in ("", "name", "party name"):
-                        continue
-
-                    filings.append({
-                        "decedent_name": decedent_name,
-                        "filing_date": filing_date,
-                        "case_number": case_number,
-                        "petitioner_name": petitioner_name,
-                        "case_type": case_type_name,
-                        "case_url": case_url,
-                        "state": "NY",
-                        "county": "Suffolk",
-                    })
-
-        except Exception as exc:
-            logger.warning("Failed to parse NYSCEF results: %s", exc)
-            traceback.print_exc()
-
-        return filings
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Georgia probate court scrapers
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _scrape_ga_probate(self, county: str, cfg: dict) -> list[dict]:
-        """
-        Attempts to scrape probate filings from a Georgia county court portal
-        using a simple HTTP GET + BeautifulSoup table parse.
-        Returns [] on failure so the caller can fall back to mock data.
-        """
-        filings: list[dict] = []
+        # Navigate to File Search
         try:
-            cutoff = datetime.date.today() - datetime.timedelta(days=LOOKBACK_DAYS)
-            params = {
-                "FilingDateFrom": cutoff.strftime("%m/%d/%Y"),
-                "FilingDateTo": datetime.date.today().strftime("%m/%d/%Y"),
-                "CaseType": "Estate",
-            }
-            resp = requests.get(
-                cfg["search_url"],
-                params=params,
-                headers=self.http_headers,
-                timeout=15,
+            page.goto(FILE_SEARCH, wait_until="domcontentloaded", timeout=30000)
+        except PWTimeout:
+            print("[probate] ERROR: Timeout on File Search page.", flush=True)
+            return False
+        time.sleep(REQUEST_DELAY)
+
+        if self._is_blocked(page):
+            self._log_block()
+            return False
+
+        print(f"[probate] File Search loaded: {page.title()}", flush=True)
+        return True
+
+    # ── File Information Search ───────────────────────────────────────────────
+    def _search_filings(
+        self, page, proceeding: str, date_from: str, date_to: str
+    ) -> list[dict]:
+        """Submit the File Information Search form and return result rows."""
+        print(f"[probate] Searching: {proceeding}", flush=True)
+
+        try:
+            page.goto(FILE_SEARCH, wait_until="domcontentloaded", timeout=30000)
+        except PWTimeout:
+            print(f"[probate] Timeout navigating to File Search for {proceeding}", flush=True)
+            return []
+        time.sleep(REQUEST_DELAY)
+
+        if self._is_blocked(page):
+            self._log_block()
+            return []
+
+        # Select Suffolk County Surrogate's Court
+        try:
+            court_sel = page.query_selector(
+                "select#Court, select[name='Court'], select[id*='ourt']"
             )
-            if resp.status_code != 200:
-                logger.debug(
-                    "GA probate portal returned HTTP %d for %s County.",
-                    resp.status_code, county,
-                )
+            if court_sel:
+                opts = court_sel.query_selector_all("option")
+                for opt in opts:
+                    if "suffolk" in opt.inner_text().lower():
+                        court_sel.select_option(value=opt.get_attribute("value"))
+                        print(f"[probate]   Court: {opt.inner_text().strip()}", flush=True)
+                        break
+        except Exception as exc:
+            print(f"[probate]   WARNING: court select: {exc}", flush=True)
+
+        time.sleep(0.5)
+
+        # Select proceeding type
+        try:
+            proc_sel = page.query_selector(
+                "select#FileProceeding, select[name='FileProceeding'], "
+                "select[id*='roceeding']"
+            )
+            if proc_sel:
+                opts = proc_sel.query_selector_all("option")
+                matched = False
+                for opt in opts:
+                    txt = opt.inner_text().strip().upper()
+                    if txt == proceeding.upper():
+                        proc_sel.select_option(value=opt.get_attribute("value"))
+                        print(f"[probate]   Proceeding: {opt.inner_text().strip()}", flush=True)
+                        matched = True
+                        break
+                if not matched:
+                    # Dump available options for debugging
+                    avail = [o.inner_text().strip() for o in opts]
+                    print(f"[probate]   Available proceedings: {avail}", flush=True)
+                    # Try partial match
+                    keyword = proceeding.split()[0]
+                    for opt in opts:
+                        if keyword.upper() in opt.inner_text().upper():
+                            proc_sel.select_option(value=opt.get_attribute("value"))
+                            print(f"[probate]   Proceeding (partial): {opt.inner_text().strip()}", flush=True)
+                            break
+        except Exception as exc:
+            print(f"[probate]   WARNING: proceeding select: {exc}", flush=True)
+
+        # Fill date range
+        try:
+            from_inp = page.query_selector(
+                "input#FromDate, input[name='FromDate'], input[id*='From']"
+            )
+            to_inp = page.query_selector(
+                "input#ToDate, input[name='ToDate'], input[id*='To']"
+            )
+            if from_inp:
+                from_inp.triple_click()
+                from_inp.type(date_from)
+                print(f"[probate]   From: {date_from}", flush=True)
+            if to_inp:
+                to_inp.triple_click()
+                to_inp.type(date_to)
+                print(f"[probate]   To:   {date_to}", flush=True)
+        except Exception as exc:
+            print(f"[probate]   WARNING: date fields: {exc}", flush=True)
+
+        # Click the Search button (second one = File Information Search section)
+        try:
+            btns = page.query_selector_all(
+                "input[value='Search'][type='submit'], "
+                "button:has-text('Search'), input[type='submit']"
+            )
+            print(f"[probate]   Found {len(btns)} Search button(s)", flush=True)
+            btn = btns[-1] if len(btns) >= 2 else (btns[0] if btns else None)
+            if btn:
+                btn.click()
+                print("[probate]   Clicked Search", flush=True)
+            else:
+                print("[probate]   ERROR: No Search button found", flush=True)
+                return []
+        except Exception as exc:
+            print(f"[probate]   ERROR clicking Search: {exc}", flush=True)
+            return []
+
+        time.sleep(REQUEST_DELAY)
+
+        if self._is_blocked(page):
+            self._log_block()
+            return []
+
+        print(f"[probate]   Results URL: {page.url}", flush=True)
+
+        # Take screenshot for debugging
+        try:
+            sshot = f"/tmp/probate_results_{proceeding.replace(' ', '_')}.png"
+            page.screenshot(path=sshot)
+            print(f"[probate]   Screenshot: {sshot}", flush=True)
+        except Exception:
+            pass
+
+        return self._parse_results_table(page, proceeding)
+
+    # ── Parse results table ───────────────────────────────────────────────────
+    def _parse_results_table(self, page, proceeding: str) -> list[dict]:
+        """Parse the FileSearchResults table. Returns list of filing dicts."""
+        filings = []
+        try:
+            html = page.content()
+            soup = BeautifulSoup(html, "html.parser")
+
+            # Find table with File #, File Date, File Name, Proceeding, DOD headers
+            result_table = None
+            for tbl in soup.find_all("table"):
+                ths = [th.get_text(strip=True).upper() for th in tbl.find_all("th")]
+                if any("FILE" in h for h in ths):
+                    result_table = tbl
+                    break
+
+            if not result_table:
+                body = soup.get_text(separator=" ", strip=True).lower()
+                if "no results" in body or "no records" in body or "0 results" in body:
+                    print(f"[probate]   No results for {proceeding}", flush=True)
+                else:
+                    print(f"[probate]   Results table not found for {proceeding}", flush=True)
+                    # Save HTML for debugging
+                    dbg = f"/tmp/probate_html_{proceeding.replace(' ', '_')}.html"
+                    with open(dbg, "w") as f:
+                        f.write(html)
+                    print(f"[probate]   HTML saved: {dbg}", flush=True)
                 return []
 
-            soup = BeautifulSoup(resp.text, "html.parser")
-            table = soup.find("table")
-            if not table:
-                return []
+            rows = result_table.find_all("tr")[1:]  # skip header
+            print(f"[probate]   {len(rows)} result rows", flush=True)
 
-            rows = table.find_all("tr")
-            for row in rows[1:]:  # skip header
-                cells = [td.get_text(strip=True) for td in row.find_all("td")]
-                if len(cells) < 3:
+            for row in rows:
+                cells = row.find_all("td")
+                if len(cells) < 4:
                     continue
-                # Try to find a link to the case
-                link_tag = row.find("a", href=True)
-                case_url = ""
-                if link_tag:
-                    href = link_tag["href"]
-                    case_url = href if href.startswith("http") else f"{cfg['url'].rstrip('/')}/{href.lstrip('/')}"
+
+                file_cell = cells[0]
+                file_link = file_cell.find("a")
+                file_number = file_link.get_text(strip=True) if file_link else file_cell.get_text(strip=True)
+                file_href   = file_link.get("href", "") if file_link else ""
+
+                file_date  = cells[1].get_text(strip=True) if len(cells) > 1 else ""
+                decedent   = cells[2].get_text(strip=True) if len(cells) > 2 else ""
+                proc_type  = cells[3].get_text(strip=True) if len(cells) > 3 else proceeding
+                dod        = cells[4].get_text(strip=True) if len(cells) > 4 else ""
+
+                if not file_number:
+                    continue
+
+                # Build absolute history URL
+                if file_href.startswith("http"):
+                    history_url = file_href
+                elif file_href.startswith("/"):
+                    history_url = BASE_URL + file_href
+                else:
+                    history_url = f"{BASE_URL}/File/FileHistory?fileNumber={file_number}"
 
                 filings.append({
-                    "decedent_name": cells[0],
-                    "filing_date": self._normalise_date(cells[1]),
-                    "case_number": cells[2] if len(cells) > 2 else "",
-                    "petitioner_name": cells[3] if len(cells) > 3 else "Unknown",
-                    "case_type": "Estate",
-                    "case_url": case_url,
-                    "state": "GA",
-                    "county": county,
+                    "file_number":   file_number,
+                    "file_date":     file_date,
+                    "decedent_name": decedent,
+                    "proceeding":    proc_type,
+                    "dod":           dod,
+                    "history_url":   history_url,
                 })
+                print(f"[probate]     {file_number} | {file_date} | {decedent} | DOD:{dod}", flush=True)
+
         except Exception as exc:
-            logger.debug("GA probate scrape failed for %s County: %s", county, exc)
+            print(f"[probate]   ERROR parsing results: {exc}", flush=True)
+            traceback.print_exc()
+
         return filings
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Database persistence
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Process one filing ────────────────────────────────────────────────────
+    def _process_filing(self, page, filing: dict) -> bool:
+        """Navigate to File History, download petition PDF, extract data, save lead."""
+        file_number = filing["file_number"]
 
-    def _save_leads(self, filings: list[dict]) -> int:
-        """
-        Saves every filing to the leads table.
-
-        For each filing:
-          1. Try to find a matching property record by decedent name.
-          2. If a match is found, use that property's address and parcel_id.
-          3. If NO match is found, save the lead anyway with:
-               - parcel_id  = NULL
-               - address    = "<decedent_name> — <county> County, <state>"
-               - owner_name stored in raw_data as 'Unknown - needs lookup'
-
-        Deduplication: one lead per case_number + source.
-
-        Returns the number of new leads inserted.
-        """
-        saved_count = 0
-        db = SessionLocal()
+        # Navigate to File History
+        print(f"[probate]   Loading File History: {filing['history_url']}", flush=True)
         try:
-            # Load all properties once for name-matching
-            properties = db.query(Property).all()
+            page.goto(filing["history_url"], wait_until="domcontentloaded", timeout=30000)
+        except PWTimeout:
+            print(f"[probate]   Timeout on File History for {file_number}", flush=True)
+            return False
+        time.sleep(REQUEST_DELAY)
 
-            for filing in filings:
-                print(
-                    f"[probate] Processing filing: {filing.get('decedent_name')} "
-                    f"({filing.get('case_number')}) — {filing.get('county')}, {filing.get('state')}",
-                    flush=True,
-                )
+        if self._is_blocked(page):
+            self._log_block()
+            return False
 
-                # Deduplication by case_number
-                case_number = filing.get("case_number", "")
-                if case_number:
-                    existing = (
-                        db.query(Lead)
-                        .filter(
-                            Lead.source == "probate",
-                            Lead.raw_data.contains(case_number),
-                        )
-                        .first()
-                    )
-                    if existing:
-                        logger.info(
-                            "  Lead already exists for case %s — skipping.", case_number
-                        )
-                        continue
+        html = page.content()
+        soup = BeautifulSoup(html, "html.parser")
 
-                # Try to find a matching property by owner name
-                matched_prop = None
-                for prop in properties:
-                    if prop.owner_name and self._is_name_match(
-                        filing["decedent_name"], prop.owner_name
-                    ):
-                        matched_prop = prop
-                        logger.info(
-                            "  MATCH: decedent '%s' → owner '%s' at '%s'",
-                            filing["decedent_name"], prop.owner_name, prop.address,
-                        )
-                        break
+        # Extract parties
+        parties = self._extract_parties(soup)
+        print(f"[probate]   Parties: {[(p['name'], p['role']) for p in parties]}", flush=True)
 
-                # Build raw_data — always includes case_number and case_url
+        # Find petition PDF link
+        pdf_url = self._find_petition_link(soup, filing["proceeding"])
+        if not pdf_url:
+            print(f"[probate]   No petition PDF link found — saving without PDF data", flush=True)
+            return self._save_no_pdf(filing, parties)
+
+        print(f"[probate]   PDF link: {pdf_url}", flush=True)
+
+        # Download PDF
+        pdf_bytes = self._download_pdf(page, pdf_url)
+        if not pdf_bytes:
+            print(f"[probate]   PDF download failed — saving without PDF data", flush=True)
+            return self._save_no_pdf(filing, parties)
+
+        print(f"[probate]   PDF size: {len(pdf_bytes):,} bytes", flush=True)
+
+        # Extract data with GPT-4o
+        pdf_data = self._extract_pdf(pdf_bytes, file_number)
+        if not pdf_data:
+            print(f"[probate]   PDF extraction failed — saving without PDF data", flush=True)
+            return self._save_no_pdf(filing, parties)
+
+        # CRITICAL FILTER: skip if no real property
+        if not pdf_data.get("has_real_property", True):
+            raw_val = pdf_data.get("real_property_value_raw", "blank/0")
+            print(f"[probate]   SKIPPED: section 3(b) = '{raw_val}' — no real property", flush=True)
+            return False
+
+        prop_val = pdf_data.get("real_property_value_dollars")
+        print(f"[probate]   Section 3(b) real property: ${prop_val:,}" if prop_val else "[probate]   Section 3(b): value present", flush=True)
+
+        return self._save_lead(filing, parties, pdf_data, pdf_url)
+
+    # ── Extract parties ───────────────────────────────────────────────────────
+    def _extract_parties(self, soup: BeautifulSoup) -> list[dict]:
+        parties = []
+        try:
+            for tbl in soup.find_all("table"):
+                ths = [th.get_text(strip=True).upper() for th in tbl.find_all("th")]
+                if "PARTY" in ths and "ROLE" in ths:
+                    for row in tbl.find_all("tr")[1:]:
+                        cells = row.find_all("td")
+                        if len(cells) >= 2:
+                            parties.append({
+                                "name": cells[0].get_text(strip=True),
+                                "role": cells[1].get_text(strip=True),
+                                "dod":  cells[2].get_text(strip=True) if len(cells) > 2 else "",
+                            })
+                    break
+        except Exception as exc:
+            print(f"[probate]   WARNING: party extraction: {exc}", flush=True)
+        return parties
+
+    # ── Find petition PDF link ────────────────────────────────────────────────
+    def _find_petition_link(self, soup: BeautifulSoup, proceeding: str) -> Optional[str]:
+        """Find the ADMINISTRATION PETITION or PROBATE PETITION document link."""
+        keywords = ["ADMINISTRATION PETITION", "PROBATE PETITION"]
+        try:
+            for link in soup.find_all("a"):
+                txt = link.get_text(strip=True).upper()
+                for kw in keywords:
+                    if kw in txt:
+                        href = link.get("href", "")
+                        if href:
+                            if href.startswith("http"):
+                                return href
+                            return BASE_URL + (href if href.startswith("/") else "/" + href)
+        except Exception as exc:
+            print(f"[probate]   WARNING: PDF link search: {exc}", flush=True)
+        return None
+
+    # ── Download PDF ──────────────────────────────────────────────────────────
+    def _download_pdf(self, page, pdf_url: str) -> Optional[bytes]:
+        time.sleep(REQUEST_DELAY)
+        try:
+            resp = page.context.request.get(pdf_url, timeout=30000)
+            if resp.status == 200:
+                body = resp.body()
+                if body[:4] == b"%PDF":
+                    return body
+                print(f"[probate]   WARNING: Response is not a PDF (first 4 bytes: {body[:4]})", flush=True)
+            else:
+                print(f"[probate]   PDF HTTP {resp.status}", flush=True)
+        except Exception as exc:
+            print(f"[probate]   Playwright PDF download error: {exc}", flush=True)
+
+        # Fallback: requests with session cookies
+        try:
+            cookies = {c["name"]: c["value"] for c in page.context.cookies()}
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Referer": BASE_URL,
+            }
+            r = requests.get(pdf_url, cookies=cookies, headers=headers, timeout=30)
+            if r.status_code == 200 and r.content[:4] == b"%PDF":
+                return r.content
+            print(f"[probate]   requests PDF HTTP {r.status_code}", flush=True)
+        except Exception as exc:
+            print(f"[probate]   requests PDF download error: {exc}", flush=True)
+        return None
+
+    # ── GPT-4o PDF extraction ─────────────────────────────────────────────────
+    def _extract_pdf(self, pdf_bytes: bytes, file_number: str) -> Optional[dict]:
+        if not _PDF2IMAGE_AVAILABLE:
+            print(f"[probate]   pdf2image not available", flush=True)
+            return None
+        if not self._openai:
+            print(f"[probate]   OpenAI not available", flush=True)
+            return None
+        try:
+            images = convert_from_bytes(pdf_bytes, dpi=200, first_page=1, last_page=2)
+            print(f"[probate]   PDF converted: {len(images)} page(s)", flush=True)
+            if not images:
+                return None
+
+            result: dict = {}
+
+            # Page 1
+            p1 = self._gpt4o_page(images[0], _PAGE1_PROMPT, f"{file_number} p1")
+            if p1:
+                result.update(p1)
+
+            # Page 2
+            if len(images) >= 2:
+                p2 = self._gpt4o_page(images[1], _PAGE2_PROMPT, f"{file_number} p2")
+                if p2:
+                    result.update(p2)
+            else:
+                # Single-page PDF — cannot check 3(b), assume real property present
+                result["has_real_property"] = True
+                result["real_property_value_raw"] = "unknown (single page)"
+                result["real_property_value_dollars"] = None
+
+            return result or None
+
+        except Exception as exc:
+            print(f"[probate]   PDF extraction error: {exc}", flush=True)
+            traceback.print_exc()
+            return None
+
+    def _gpt4o_page(self, image, prompt: str, label: str) -> Optional[dict]:
+        try:
+            buf = io.BytesIO()
+            image.save(buf, format="JPEG", quality=90)
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            print(f"[probate]   GPT-4o: {label} ({len(b64)//1024}KB)...", flush=True)
+
+            resp = self._openai.chat.completions.create(
+                model=GPT_MODEL,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:image/jpeg;base64,{b64}",
+                            "detail": "high",
+                        }},
+                    ],
+                }],
+                max_tokens=1000,
+                temperature=0,
+            )
+            raw = resp.choices[0].message.content.strip()
+            print(f"[probate]   GPT-4o {label}: {raw[:150]}", flush=True)
+
+            # Strip markdown fences
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw).strip()
+            return json.loads(raw)
+
+        except json.JSONDecodeError as exc:
+            print(f"[probate]   GPT-4o non-JSON for {label}: {exc}", flush=True)
+            return None
+        except Exception as exc:
+            print(f"[probate]   GPT-4o error for {label}: {exc}", flush=True)
+            return None
+
+    # ── Save lead with full PDF data ──────────────────────────────────────────
+    def _save_lead(self, filing: dict, parties: list, pdf_data: dict, pdf_url: str) -> bool:
+        if not _DB_AVAILABLE:
+            print("[probate]   DB not available — printing lead summary:", flush=True)
+            print(f"[probate]   Decedent: {pdf_data.get('decedent_name', filing['decedent_name'])}", flush=True)
+            print(f"[probate]   Address:  {self._build_addr(pdf_data, 'decedent')}", flush=True)
+            print(f"[probate]   Petitioner: {pdf_data.get('petitioner_name')} | {pdf_data.get('petitioner_phone')}", flush=True)
+            return False
+
+        try:
+            db = SessionLocal()
+            try:
+                # Dedup by file_number
+                existing = db.query(Lead).filter(
+                    Lead.source == "probate",
+                    Lead.raw_data.contains(filing["file_number"])
+                ).first()
+                if existing:
+                    print(f"[probate]   DUPLICATE: {filing['file_number']} (lead id={existing.id})", flush=True)
+                    return False
+
+                decedent_addr = self._build_addr(pdf_data, "decedent")
+                petitioner_addr = self._build_addr(pdf_data, "petitioner")
+
+                if not decedent_addr:
+                    decedent_addr = f"{filing['decedent_name']} — Suffolk County, NY"
+
                 raw_data = {
-                    "decedent_name": filing.get("decedent_name", ""),
-                    "filing_date": filing.get("filing_date", ""),
-                    "case_number": filing.get("case_number", ""),
-                    "case_url": filing.get("case_url", ""),
-                    "petitioner_name": filing.get("petitioner_name", "Unknown"),
-                    "case_type": filing.get("case_type", ""),
-                    "state": filing.get("state", "NY"),
-                    "county": filing.get("county", "Suffolk"),
+                    "file_number":              filing["file_number"],
+                    "file_date":                filing["file_date"],
+                    "proceeding":               filing["proceeding"],
+                    "case_url":                 filing["history_url"],
+                    "pdf_url":                  pdf_url,
+                    "decedent_name":            pdf_data.get("decedent_name") or filing["decedent_name"],
+                    "decedent_address":         decedent_addr,
+                    "date_of_death":            pdf_data.get("date_of_death") or filing.get("dod", ""),
+                    "township":                 pdf_data.get("township"),
+                    "county":                   pdf_data.get("county", "Suffolk"),
+                    "place_of_death":           pdf_data.get("place_of_death"),
+                    "petitioner_name":          pdf_data.get("petitioner_name"),
+                    "petitioner_address":       petitioner_addr,
+                    "petitioner_phone":         pdf_data.get("petitioner_phone"),
+                    "petitioner_relationship":  pdf_data.get("petitioner_relationship"),
+                    "real_property_value":      pdf_data.get("real_property_value_dollars"),
+                    "real_property_value_raw":  pdf_data.get("real_property_value_raw"),
+                    "parties":                  parties,
                 }
 
-                if matched_prop:
-                    raw_data["property_address"] = matched_prop.address
-                    raw_data["owner_name"] = matched_prop.owner_name
-                    lead_address = matched_prop.address
-                    lead_parcel_id = matched_prop.parcel_id
-                else:
-                    # Save unmatched lead — parcel_id is NULL
-                    raw_data["owner_name"] = "Unknown - needs lookup"
-                    lead_address = (
-                        f"{filing.get('decedent_name', 'Unknown')} — "
-                        f"{filing.get('county', 'Unknown')} County, {filing.get('state', 'NY')}"
-                    )
-                    lead_parcel_id = None
-                    logger.info(
-                        "  No property match for '%s' — saving unmatched lead (parcel_id=NULL).",
-                        filing.get("decedent_name"),
-                    )
+                # Try to match existing property record
+                matched = None
+                if Property and decedent_addr:
+                    street = decedent_addr.split(",")[0].strip()[:30]
+                    try:
+                        matched = db.query(Property).filter(
+                            Property.address.ilike(f"%{street}%")
+                        ).first()
+                    except Exception:
+                        pass
 
                 lead = Lead(
-                    address=lead_address,
-                    parcel_id=lead_parcel_id,
+                    address=decedent_addr,
+                    parcel_id=matched.parcel_id if matched else None,
                     source="probate",
                     raw_data=json.dumps(raw_data),
-                    score=0.90,  # Probate leads are very high value
+                    score=self._score(pdf_data),
                     status="new",
-                    state=filing.get("state", "NY"),
-                    county=filing.get("county", "Suffolk"),
+                    state="NY",
+                    county=pdf_data.get("county", "Suffolk"),
                 )
                 db.add(lead)
-                saved_count += 1
-                logger.info(
-                    "  Saved probate lead: %s (parcel_id=%s)",
-                    lead_address[:60], lead_parcel_id,
-                )
+                db.flush()
 
-            db.commit()
-            print(f"[probate] Committed {saved_count} new lead(s) to database.", flush=True)
+                # Save petitioner as contact
+                petitioner_name = pdf_data.get("petitioner_name")
+                if petitioner_name:
+                    contact = Contact(
+                        lead_id=lead.id,
+                        owner_name=petitioner_name,
+                        phone=pdf_data.get("petitioner_phone"),
+                        email=None,
+                        source="probate",
+                    )
+                    db.add(contact)
+
+                db.commit()
+                print(f"[probate]   SAVED: lead id={lead.id} | {decedent_addr}", flush=True)
+                if petitioner_name:
+                    print(f"[probate]   CONTACT: {petitioner_name} ({pdf_data.get('petitioner_relationship')}) {pdf_data.get('petitioner_phone', '')}", flush=True)
+                return True
+
+            except Exception as exc:
+                db.rollback()
+                print(f"[probate]   DB save error: {exc}", flush=True)
+                traceback.print_exc()
+                return False
+            finally:
+                db.close()
 
         except Exception as exc:
-            db.rollback()
-            print(f"[probate] Database error — rolled back: {exc}", flush=True)
-            logger.error("Database error in _save_leads: %s", exc)
-            traceback.print_exc()
-            raise
-        finally:
-            db.close()
+            print(f"[probate]   DB session error: {exc}", flush=True)
+            return False
 
-        return saved_count
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Utility helpers
-    # ─────────────────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _normalise_date(raw: str) -> str:
-        """Normalise a date string to YYYY-MM-DD. Falls back to today."""
-        for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%B %d, %Y", "%b %d, %Y"):
+    # ── Save lead without PDF data ────────────────────────────────────────────
+    def _save_no_pdf(self, filing: dict, parties: list) -> bool:
+        """Save a lead using only results-table data when PDF is unavailable."""
+        if not _DB_AVAILABLE:
+            return False
+        try:
+            db = SessionLocal()
             try:
-                return datetime.datetime.strptime(raw.strip(), fmt).strftime("%Y-%m-%d")
-            except (ValueError, AttributeError):
-                continue
-        return datetime.date.today().strftime("%Y-%m-%d")
+                existing = db.query(Lead).filter(
+                    Lead.source == "probate",
+                    Lead.raw_data.contains(filing["file_number"])
+                ).first()
+                if existing:
+                    print(f"[probate]   DUPLICATE: {filing['file_number']}", flush=True)
+                    return False
 
-    @staticmethod
-    def _is_name_match(name1: str, name2: str) -> bool:
-        """
-        Flexible name matching.  Returns True when at least two non-trivial
-        tokens (length > 1) are shared between the two names (case-insensitive).
-        """
-        def tokens(n: str) -> set:
-            return {p for p in re.sub(r"[.,]", "", n).upper().split() if len(p) > 1}
-        shared = tokens(name1) & tokens(name2)
-        return len(shared) >= 2
+                decedent = next(
+                    (p for p in parties if "DECEDENT" in p.get("role", "").upper()), None
+                )
+                name = decedent["name"] if decedent else filing["decedent_name"]
+                address = f"{name} — Suffolk County, NY (address pending PDF read)"
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Fallback mock data
-    # ─────────────────────────────────────────────────────────────────────────
+                raw_data = {
+                    "file_number":   filing["file_number"],
+                    "file_date":     filing["file_date"],
+                    "proceeding":    filing["proceeding"],
+                    "case_url":      filing["history_url"],
+                    "decedent_name": name,
+                    "date_of_death": filing.get("dod", ""),
+                    "parties":       parties,
+                    "note":          "PDF not available or could not be read",
+                }
 
-    @staticmethod
-    def _get_mock_filings(state: str = "NY", county: str = "Suffolk") -> list[dict]:
-        """
-        Returns representative mock probate filings for the given state/county.
-        Used as a fallback when live scraping is blocked or the portal is down.
-        Each mock filing includes a plausible case_url so the raw_data field
-        is always populated with a clickable link.
-        """
+                lead = Lead(
+                    address=address,
+                    parcel_id=None,
+                    source="probate",
+                    raw_data=json.dumps(raw_data),
+                    score=50.0,
+                    status="new",
+                    state="NY",
+                    county="Suffolk",
+                )
+                db.add(lead)
+                db.commit()
+                print(f"[probate]   SAVED (no PDF): lead id={lead.id}", flush=True)
+                return True
+
+            except Exception as exc:
+                db.rollback()
+                print(f"[probate]   DB save error (no PDF): {exc}", flush=True)
+                return False
+            finally:
+                db.close()
+
+        except Exception as exc:
+            print(f"[probate]   DB session error: {exc}", flush=True)
+            return False
+
+    # ── Georgia scraper ───────────────────────────────────────────────────────
+    def _scrape_georgia(self) -> int:
+        """Attempt to scrape Georgia county probate courts via HTTP."""
+        total = 0
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
+        })
+        for county, url in GA_PROBATE_COURTS.items():
+            print(f"[probate] Georgia/{county}: {url}", flush=True)
+            try:
+                resp = session.get(url, timeout=15)
+                if resp.status_code != 200:
+                    print(f"[probate]   HTTP {resp.status_code}", flush=True)
+                    time.sleep(REQUEST_DELAY)
+                    continue
+                soup = BeautifulSoup(resp.text, "html.parser")
+                # Log any filing/estate/petition links found for manual review
+                links = [
+                    a for a in soup.find_all("a", href=True)
+                    if any(kw in a.get_text(strip=True).lower()
+                           for kw in ["estate", "probate", "filing", "petition", "recent"])
+                ]
+                if links:
+                    print(f"[probate]   Found {len(links)} potential filing links:", flush=True)
+                    for lnk in links[:5]:
+                        print(f"[probate]     {lnk.get_text(strip=True)[:60]}: {lnk['href']}", flush=True)
+                else:
+                    print(f"[probate]   No filing links found (portal may require login)", flush=True)
+            except Exception as exc:
+                print(f"[probate]   ERROR Georgia/{county}: {exc}", flush=True)
+            time.sleep(REQUEST_DELAY)
+        return total
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    def _is_blocked(self, page) -> bool:
+        title = page.title().lower()
+        if "request could not be processed" in title or "just a moment" in title:
+            return True
+        try:
+            body = page.inner_text("body")[:500].lower()
+            if "request could not be processed" in body or "disabling your vpn" in body:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _log_block(self):
+        if self._blocked:
+            return
+        self._blocked = True
+        print("", flush=True)
+        print("[probate] *** IP BLOCK DETECTED ***", flush=True)
+        print("[probate] websurrogates.nycourts.gov blocks data-center IPs.", flush=True)
+        print("[probate] Fix: export browser cookies and set:", flush=True)
+        print("[probate]   WEBSURROGATES_COOKIE_FILE=/path/to/cookies.json", flush=True)
+        print("[probate]   or WEBSURROGATES_COOKIES_JSON='[{...}]'", flush=True)
+        print("[probate] Use EditThisCookie Chrome extension to export.", flush=True)
+        print("[probate] Cookies expire every ~24 hours.", flush=True)
+        print("[probate] Saving 0 leads this run.", flush=True)
+        print("", flush=True)
+
+    def _date_range(self) -> tuple[str, str]:
         today = datetime.date.today()
-        year = today.year
-        abbr = county.upper()[:3]
+        start = today - datetime.timedelta(days=self.days)
+        return start.strftime("%m/%d/%Y"), today.strftime("%m/%d/%Y")
 
-        names_by_county: dict[str, list[tuple[str, str]]] = {
-            "Suffolk": [
-                ("JOHN DOE", "Probate"),
-                ("JANE SMITH", "Administration"),
-                ("ROBERT JOHNSON", "Probate"),
-            ],
-            "Fulton": [
-                ("WILLIAM HARRIS", "Probate"),
-                ("PATRICIA CLARK", "Administration"),
-                ("JAMES LEWIS", "Probate"),
-            ],
-            "Gwinnett": [
-                ("BARBARA WALKER", "Probate"),
-                ("CHARLES HALL", "Administration"),
-                ("DOROTHY ALLEN", "Probate"),
-            ],
-            "Cobb": [
-                ("RICHARD YOUNG", "Probate"),
-                ("MARGARET KING", "Administration"),
-                ("JOSEPH WRIGHT", "Probate"),
-            ],
-            "DeKalb": [
-                ("THOMAS SCOTT", "Probate"),
-                ("HELEN GREEN", "Administration"),
-                ("CHARLES BAKER", "Probate"),
-            ],
-            "Chatham": [
-                ("MARY ADAMS", "Probate"),
-                ("GEORGE NELSON", "Administration"),
-                ("RUTH CARTER", "Probate"),
-            ],
-            "Clarke": [
-                ("FRANK MITCHELL", "Probate"),
-                ("VIRGINIA PEREZ", "Administration"),
-                ("HENRY ROBERTS", "Probate"),
-            ],
-        }
-        entries = names_by_county.get(county, [("JOHN DOE", "Probate"), ("JANE SMITH", "Administration")])
+    def _build_addr(self, data: dict, prefix: str) -> str:
+        parts = [
+            data.get(f"{prefix}_street", ""),
+            data.get(f"{prefix}_city_town", ""),
+            data.get(f"{prefix}_state", ""),
+            data.get(f"{prefix}_zip", ""),
+        ]
+        return ", ".join(p.strip() for p in parts if p and p.strip())
 
-        filings = []
-        for i, (name, case_type) in enumerate(entries):
-            case_num = f"{abbr}-{year}-PR-{i + 1:03d}"
-            # For NY, generate a plausible NYSCEF URL; for GA, use a generic placeholder
-            if state == "NY":
-                case_url = f"https://iapps.courts.state.ny.us/nyscef/CaseDetails?docketId=MOCK{case_num.replace('-', '')}"
-            else:
-                case_url = f"https://www.{county.lower()}countyprobate.gov/case/{case_num}"
-
-            filings.append({
-                "decedent_name": name,
-                "filing_date": (today - datetime.timedelta(days=i + 2)).strftime("%Y-%m-%d"),
-                "case_number": case_num,
-                "petitioner_name": f"Estate of {name.title()}",
-                "case_type": case_type,
-                "case_url": case_url,
-                "state": state,
-                "county": county,
-            })
-        return filings
+    def _score(self, pdf_data: dict) -> float:
+        score = 60.0
+        val = pdf_data.get("real_property_value_dollars")
+        if val:
+            if val >= 500000:   score += 30
+            elif val >= 200000: score += 20
+            elif val >= 100000: score += 10
+        if pdf_data.get("petitioner_phone"):  score += 5
+        if pdf_data.get("decedent_street"):   score += 5
+        return min(score, 100.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLI entry point
+# CLI
 # ─────────────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Suffolk Leads — Probate Scraper")
-    parser.add_argument(
-        "--cookie-file",
-        metavar="PATH",
-        help=(
-            "Path to a JSON file containing browser cookies exported from a real "
-            "browser session on iapps.courts.state.ny.us.  Used to bypass Cloudflare. "
-            "Use the EditThisCookie Chrome extension or browser DevTools → "
-            "Application → Cookies → Export JSON."
-        ),
-    )
+def main():
+    parser = argparse.ArgumentParser(description="Probate court scraper — WebSurrogates")
+    parser.add_argument("--cookie-file", default=os.getenv("WEBSURROGATES_COOKIE_FILE", ""),
+                        help="Path to JSON cookie file from a real browser session")
+    parser.add_argument("--days", type=int, default=7,
+                        help="Days back to search (default: 7)")
+    parser.add_argument("--georgia-only", action="store_true")
+    parser.add_argument("--ny-only", action="store_true")
     args = parser.parse_args()
 
-    scraper = ProbateScraper(cookie_file=args.cookie_file)
-    scraper.scrape()
+    scraper = ProbateScraper(cookie_file=args.cookie_file, days=args.days)
+
+    if args.georgia_only:
+        scraper._scrape_georgia()
+    elif args.ny_only:
+        # Run only NY portion
+        scraper.scrape()
+    else:
+        scraper.scrape()
+
+
+if __name__ == "__main__":
+    main()
