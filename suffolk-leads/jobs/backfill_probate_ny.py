@@ -214,34 +214,29 @@ def scrape_truepeoplesearch_sync(name: str, address: str) -> list[str]:
     print(f"[enrich] TruePeopleSearch URL: {search_url}", flush=True)
     
     phones = []
-    proxy_list = get_proxy_list()
-    proxies_to_try = proxy_list if proxy_list else [None]
-    for _proxy_idx, _proxy_cfg in enumerate(proxies_to_try):
-        _proxy_label = _proxy_cfg['server'] if _proxy_cfg else 'direct'
-        print(f"[enrich] TruePeopleSearch attempt {_proxy_idx + 1}/{len(proxies_to_try)} via {_proxy_label}", flush=True)
-        try:
-            with sync_playwright() as pw:
-                browser = pw.chromium.launch(headless=True, proxy=_proxy_cfg)
-                context = browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                    viewport={"width": random.randint(1280, 1920), "height": random.randint(768, 1080)},
-                    locale="en-US",
-                    timezone_id="America/New_York",
-                    ignore_https_errors=True,
-                )
-                context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-                page = context.new_page()
-            
-                try:
-                    page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
-                    time.sleep(random.uniform(2.0, 4.0))
-                    content = page.content()
+    _proxy_cfg = get_brightdata_proxy()
+    _proxy_label = _proxy_cfg['server'] if _proxy_cfg else 'direct (no proxy)'
+    print(f"[enrich] TruePeopleSearch via {_proxy_label}", flush=True)
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True, proxy=_proxy_cfg)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width": random.randint(1280, 1920), "height": random.randint(768, 1080)},
+                locale="en-US",
+                timezone_id="America/New_York",
+                ignore_https_errors=True,
+            )
+            context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            page = context.new_page()
+            try:
+                page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+                time.sleep(random.uniform(2.0, 4.0))
+                content = page.content()
 
-                    if any(sig in content.lower() for sig in ["captcha", "recaptcha", "cloudflare", "just a moment", "verify you are human"]):
-                        print(f"[enrich] CAPTCHA/block detected via {_proxy_label} — trying next proxy", flush=True)
-                        browser.close()
-                        continue
-
+                if any(sig in content.lower() for sig in ["captcha", "recaptcha", "cloudflare", "just a moment", "verify you are human"]):
+                    print(f"[enrich] CAPTCHA/block detected on TruePeopleSearch via {_proxy_label}", flush=True)
+                else:
                     # Try to click the first profile
                     try:
                         profile_link = page.query_selector("a[href*='/find/person/'], a[href*='/results/'], .card-summary a")
@@ -260,15 +255,17 @@ def scrape_truepeoplesearch_sync(name: str, address: str) -> list[str]:
                     phones = _extract_phones_from_html(content)
                     print(f"[enrich] TruePeopleSearch: {len(phones)} phone(s) found for '{name}'", flush=True)
 
-                except Exception as exc:
-                    print(f"[enrich] TruePeopleSearch page error via {_proxy_label}: {exc}", flush=True)
-                finally:
+            except Exception as exc:
+                print(f"[enrich] TruePeopleSearch page error: {exc}", flush=True)
+                traceback.print_exc()
+            finally:
+                try:
                     browser.close()
-
-                break  # success — stop trying more proxies
-
-        except Exception as exc:
-            print(f"[enrich] Playwright launch error via {_proxy_label}: {exc}", flush=True)
+                except Exception:
+                    pass
+    except Exception as exc:
+        print(f"[enrich] Playwright launch error for TruePeopleSearch: {exc}", flush=True)
+        traceback.print_exc()
 
     return phones
 
@@ -383,48 +380,27 @@ def send_email_with_sendgrid(
 
 
 
-def get_proxy_list():
-    """Return a list of proxy config dicts from PROXY_LIST env var.
+def get_brightdata_proxy():
+    """Return a Playwright proxy config dict for the Brightdata residential proxy.
 
-    PROXY_LIST format: comma-separated entries of IP:PORT:USER:PASS
-    e.g. "1.2.3.4:8080:user1:pass1,5.6.7.8:3128:user2:pass2"
-
-    Falls back to single PROXY_HOST/PROXY_PORT/PROXY_USERNAME/PROXY_PASSWORD
-    env vars if PROXY_LIST is not set.  Returns an empty list if no proxy
-    is configured (browser will connect directly).
+    Reads PROXY_HOST, PROXY_PORT, PROXY_USERNAME, PROXY_PASSWORD from Railway
+    environment variables.  Returns None if PROXY_HOST is not set (direct
+    connection will be used instead).
     """
-    raw = os.environ.get('PROXY_LIST', '').strip()
-    proxies = []
-    if raw:
-        for entry in raw.split(','):
-            entry = entry.strip()
-            if not entry:
-                continue
-            parts = entry.split(':')
-            if len(parts) >= 2:
-                host, port = parts[0], parts[1]
-                user = parts[2] if len(parts) > 2 else None
-                pwd  = parts[3] if len(parts) > 3 else None
-                cfg = {'server': f'http://{host}:{port}'}
-                if user:
-                    cfg['username'] = user
-                if pwd:
-                    cfg['password'] = pwd
-                proxies.append(cfg)
-    if not proxies:
-        # Fall back to single-proxy env vars
-        host = os.environ.get('PROXY_HOST')
-        port = os.environ.get('PROXY_PORT')
-        if host and port:
-            cfg = {'server': f'http://{host}:{port}'}
-            user = os.environ.get('PROXY_USERNAME')
-            pwd  = os.environ.get('PROXY_PASSWORD')
-            if user:
-                cfg['username'] = user
-            if pwd:
-                cfg['password'] = pwd
-            proxies.append(cfg)
-    return proxies
+    host = os.environ.get('PROXY_HOST', '').strip()
+    port = os.environ.get('PROXY_PORT', '').strip()
+    if not host or not port:
+        print('[backfill] WARNING: PROXY_HOST/PROXY_PORT not set — connecting directly.', flush=True)
+        return None
+    cfg = {'server': f'http://{host}:{port}'}
+    user = os.environ.get('PROXY_USERNAME', '').strip()
+    pwd  = os.environ.get('PROXY_PASSWORD', '').strip()
+    if user:
+        cfg['username'] = user
+    if pwd:
+        cfg['password'] = pwd
+    print(f'[backfill] Brightdata proxy: {host}:{port} (user={user or "(none)"})', flush=True)
+    return cfg
 
 
 def sanitize_cookies(cookies):
@@ -905,6 +881,35 @@ class NYBackfillScraper:
 
 # ── CSV Export Helper ────────────────────────────────────────────────────────
 
+
+def restore_railway_toml():
+    """Rewrite railway.toml startCommand back to 'python main.py' so the daily
+    scraper resumes automatically the next morning without manual intervention.
+    """
+    toml_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "railway.toml")
+    if not os.path.exists(toml_path):
+        print(f"[backfill] WARNING: railway.toml not found at {toml_path} — skipping restore.", flush=True)
+        return
+    try:
+        with open(toml_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        import re as _re
+        new_content = _re.sub(
+            r'(startCommand\s*=\s*")[^"]*(")',
+            r'python main.py',
+            content,
+        )
+        if new_content == content:
+            print("[backfill] railway.toml startCommand already set to 'python main.py' — no change needed.", flush=True)
+            return
+        with open(toml_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        print("[backfill] railway.toml startCommand restored to 'python main.py'.", flush=True)
+    except Exception as exc:
+        print(f"[backfill] ERROR: Failed to restore railway.toml: {exc}", flush=True)
+        traceback.print_exc()
+
+
 def generate_csv(leads, filepath):
     import csv
     try:
@@ -969,73 +974,62 @@ def main():
     scraper = NYBackfillScraper(cookies_json=cookies_json, limit=args.limit)
 
     # Run Playwright search loop
-    proxy_list = get_proxy_list()
-    # Always append None as a last-resort direct (no-proxy) attempt
-    proxies_to_try = proxy_list + [None] if proxy_list else [None]
-    print(f"[backfill] Proxy pool: {len(proxy_list)} proxy(ies) + 1 direct fallback.", flush=True)
+    _proxy_cfg = get_brightdata_proxy()
+    _proxy_label = _proxy_cfg['server'] if _proxy_cfg else 'direct (no proxy)'
+    print(f"[backfill] Using proxy: {_proxy_label}", flush=True)
 
     browser = None
     page = None
     _pw_instance = None
 
-    for _proxy_idx, _proxy_cfg in enumerate(proxies_to_try):
-        _proxy_label = _proxy_cfg['server'] if _proxy_cfg else 'direct (no proxy)'
-        print(f"[backfill] Attempt {_proxy_idx + 1}/{len(proxies_to_try)}: {_proxy_label}", flush=True)
-        # Wait 10 seconds between attempts to avoid hammering the site
-        if _proxy_idx > 0:
-            print(f"[backfill] Waiting 10s before next attempt...", flush=True)
-            time.sleep(10)
-        try:
-            _pw_instance = sync_playwright().start()
-            browser = _pw_instance.chromium.launch(
-                headless=True,
-                proxy=_proxy_cfg,
-                args=["--no-sandbox", "--disable-dev-shm-usage",
-                      "--disable-blink-features=AutomationControlled"],
-            )
-            ctx = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 900},
-                locale="en-US",
-                timezone_id="America/New_York",
-                ignore_https_errors=True,
-            )
-            ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
-            if scraper._session_cookies:
-                ctx.add_cookies(scraper._session_cookies)
-            page = ctx.new_page()
-            # websurrogates.nycourts.gov is a public site — no login needed.
-            # Navigate directly to File Search; cookies handle Cloudflare bypass.
-            # Use a 60s timeout to avoid prematurely flagging slow proxies as blocked.
-            print(f"[backfill] Navigating directly to File Search via {_proxy_label}", flush=True)
-            page.goto(FILE_SEARCH, wait_until="domcontentloaded", timeout=60000)
-            time.sleep(REQUEST_DELAY)
-            if scraper._is_blocked(page):
-                print(f"[backfill] Blocked via {_proxy_label} — trying next.", flush=True)
+    try:
+        _pw_instance = sync_playwright().start()
+        browser = _pw_instance.chromium.launch(
+            headless=True,
+            proxy=_proxy_cfg,
+            args=["--no-sandbox", "--disable-dev-shm-usage",
+                  "--disable-blink-features=AutomationControlled"],
+        )
+        ctx = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 900},
+            locale="en-US",
+            timezone_id="America/New_York",
+            ignore_https_errors=True,
+        )
+        ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+        if scraper._session_cookies:
+            ctx.add_cookies(scraper._session_cookies)
+        page = ctx.new_page()
+        # websurrogates.nycourts.gov is a public site — no login needed.
+        # Navigate directly to File Search; cookies handle Cloudflare bypass.
+        print(f"[backfill] Navigating directly to File Search via {_proxy_label}", flush=True)
+        page.goto(FILE_SEARCH, wait_until="domcontentloaded", timeout=60000)
+        time.sleep(REQUEST_DELAY)
+        if scraper._is_blocked(page):
+            print(f"[backfill] ERROR: Blocked on File Search via {_proxy_label}.", flush=True)
+            print("[backfill] Check that WEBSURROGATES_COOKIES_JSON is fresh and proxy credentials are correct.", flush=True)
+            browser.close()
+            _pw_instance.stop()
+            sys.exit(1)
+        print(f"[backfill] Connected successfully via {_proxy_label}.", flush=True)
+    except Exception as _launch_err:
+        print(f"[backfill] ERROR: Browser launch failed: {_launch_err}", flush=True)
+        traceback.print_exc()
+        if browser:
+            try:
                 browser.close()
+            except Exception:
+                pass
+        if _pw_instance:
+            try:
                 _pw_instance.stop()
-                browser = None
-                page = None
-                continue
-            print(f"[backfill] Connected successfully via {_proxy_label}.", flush=True)
-            break  # good connection — proceed with scrape
-        except Exception as _proxy_err:
-            print(f"[backfill] {_proxy_label} failed: {_proxy_err}", flush=True)
-            if browser:
-                try:
-                    browser.close()
-                except Exception:
-                    pass
-            if _pw_instance:
-                try:
-                    _pw_instance.stop()
-                except Exception:
-                    pass
-            browser = None
-            page = None
+            except Exception:
+                pass
+        sys.exit(1)
 
     if browser is None or page is None:
-        print("[backfill] All proxies and direct connection failed or are blocked. Exiting.", flush=True)
+        print("[backfill] ERROR: Could not establish browser session. Exiting.", flush=True)
         sys.exit(1)
 
     try:
@@ -1158,6 +1152,9 @@ def main():
             print(f"[backfill] Warning: failed to delete temporary CSV: {exc}", flush=True)
     else:
         print("[backfill] ERROR: Failed to generate CSV. Email not sent.", flush=True)
+
+    # Restore railway.toml so the daily scraper resumes tomorrow morning
+    restore_railway_toml()
 
     print("[backfill] JOB FINISHED.", flush=True)
 
