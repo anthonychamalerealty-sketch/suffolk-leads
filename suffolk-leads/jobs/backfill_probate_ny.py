@@ -227,6 +227,7 @@ def scrape_truepeoplesearch_sync(name: str, address: str) -> list[str]:
                     viewport={"width": random.randint(1280, 1920), "height": random.randint(768, 1080)},
                     locale="en-US",
                     timezone_id="America/New_York",
+                    ignore_https_errors=True,
                 )
                 context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
                 page = context.new_page()
@@ -997,6 +998,7 @@ def main():
                 viewport={"width": 1280, "height": 900},
                 locale="en-US",
                 timezone_id="America/New_York",
+                ignore_https_errors=True,
             )
             ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
             if scraper._session_cookies:
