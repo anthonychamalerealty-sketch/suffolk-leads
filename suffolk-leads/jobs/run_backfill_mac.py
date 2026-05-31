@@ -4,40 +4,49 @@ run_backfill_mac.py
 -------------------
 Standalone Mac backfill script for NY probate records.
 
-Runs DIRECTLY from your home IP — NO cookies, NO proxy required.
+Connects to YOUR EXISTING Chrome browser via Chrome DevTools Protocol (CDP).
+Cloudflare sees a real Chrome browser with real fingerprints — no bot detection.
 
-How it works
-============
-1. Opens a VISIBLE Chrome browser window (you can see it on screen).
-2. Navigates to https://websurrogates.nycourts.gov/File/FileSearch
-3. Waits 30 seconds and asks you to complete any Cloudflare challenge manually.
-4. Once you press Enter in Terminal, the script takes over and runs
-   automatically for the full 24-month backfill — no more interruptions.
-5. The browser window stays open throughout the entire run.
+─────────────────────────────────────────────────────────────────────────────
+STEP-BY-STEP INSTRUCTIONS (read before running)
+─────────────────────────────────────────────────────────────────────────────
 
-What it extracts
-================
-- Decedent name, address, date of death
-- Petitioner name, address, phone number, relationship
-- Section 3(b) real property value (skips $0 / NONE cases)
+STEP 1 — Quit Chrome completely (Cmd+Q), then relaunch it with remote
+          debugging enabled by running this command in Terminal:
 
-Output
-======
-- ~/Desktop/backfill_results.csv
-- Email sent to Anthonychamalerealty@gmail.com via SendGrid when complete
-- Progress saved to backfill_progress.json (resume if interrupted)
+  /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222
+
+  A Chrome window will open. Leave it running.
+
+STEP 2 — In that Chrome window, navigate to:
+  https://websurrogates.nycourts.gov/File/FileSearch
+
+  Complete any Cloudflare challenge that appears. Once you see the
+  File Search form, you are ready.
+
+STEP 3 — In a SECOND Terminal tab/window, run this script:
+  python3 run_backfill_mac.py
+
+  The script will connect to your Chrome session and run the full
+  24-month backfill automatically. Do NOT close Chrome until it finishes.
+
+─────────────────────────────────────────────────────────────────────────────
+What the script does
+─────────────────────────────────────────────────────────────────────────────
+- Connects to Chrome at http://localhost:9222 via CDP
+- Searches Suffolk County and Nassau County Surrogate's Courts
+- Loops through 24 monthly date blocks (oldest → newest)
+- Searches ADMINISTRATION PETITION and PROBATE PETITION types
+- Uses GPT-4o vision to extract decedent/petitioner data from each petition
+- Skips cases where section 3(b) real property value is $0 / NONE
+- Saves results to ~/Desktop/backfill_results.csv
+- Saves progress to backfill_progress.json (resume if interrupted)
+- Sends final CSV to Anthonychamalerealty@gmail.com via SendGrid
 
 Required environment variables
 ================================
   OPENAI_API_KEY    — OpenAI API key for GPT-4o vision extraction
   SENDGRID_API_KEY  — SendGrid API key for the final email
-
-Usage
-=====
-  Set the env vars and run:
-    python3 run_backfill_mac.py
-
-  Or double-click run_mac.sh (after filling in your API keys).
 """
 
 from __future__ import annotations
@@ -63,6 +72,7 @@ CSV_PATH      = DESKTOP / "backfill_results.csv"
 # ── Constants ─────────────────────────────────────────────────────────────────
 BASE_URL        = "https://websurrogates.nycourts.gov"
 FILE_SEARCH     = f"{BASE_URL}/File/FileSearch"
+CDP_URL         = "http://localhost:9222"
 REQUEST_DELAY   = 3        # seconds between page loads
 MONTHS_BACK     = 24       # how many months of history to backfill
 TARGET_COURTS   = [
@@ -72,7 +82,6 @@ TARGET_COURTS   = [
 PROCEEDINGS     = ["ADMINISTRATION PETITION", "PROBATE PETITION"]
 RECIPIENT_EMAIL = "Anthonychamalerealty@gmail.com"
 GPT_MODEL       = "gpt-4o"
-CLOUDFLARE_WAIT = 30       # seconds to show the browser before prompting user
 
 # ── Environment ───────────────────────────────────────────────────────────────
 _OPENAI_API_KEY   = os.environ.get("OPENAI_API_KEY", "")
@@ -161,13 +170,12 @@ def save_progress(progress: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def write_csv(leads: list[dict], path: Path) -> bool:
-    """Write leads to a CSV file on the Desktop.  Returns True on success."""
+    """Write leads to a CSV file on the Desktop. Returns True on success."""
     try:
         if not leads:
             print("[mac] No leads to write.", flush=True)
             return False
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Flatten raw_data dict into top-level columns
         flat_leads = []
         for lead in leads:
             row = {k: v for k, v in lead.items() if k != "raw_data"}
@@ -177,7 +185,6 @@ def write_csv(leads: list[dict], path: Path) -> bool:
                     if rk not in row:
                         row[rk] = rv
             flat_leads.append(row)
-        # Collect all field names preserving insertion order
         fieldnames: list[str] = []
         seen: set[str] = set()
         for row in flat_leads:
@@ -251,7 +258,7 @@ def send_email(to_email: str, subject: str, html_body: str,
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MacBackfillScraper:
-    """Runs the WebSurrogates backfill in a visible browser window on Mac."""
+    """Runs the WebSurrogates backfill via an existing Chrome CDP session."""
 
     # ── Block detection ───────────────────────────────────────────────────────
     def _is_blocked(self, page) -> bool:
@@ -286,7 +293,7 @@ class MacBackfillScraper:
         time.sleep(REQUEST_DELAY)
 
         if self._is_blocked(page):
-            print("[mac] BLOCKED on File Search — Cloudflare challenge may have reappeared.", flush=True)
+            print("[mac] BLOCKED on File Search — Cloudflare may have returned.", flush=True)
             return []
 
         # Select Court
@@ -473,10 +480,10 @@ class MacBackfillScraper:
         # Build addresses
         def _addr(prefix: str) -> str:
             parts = [
-                pdf_data.get(f"{prefix}_street", "") or "",
-                pdf_data.get(f"{prefix}_city_town", "") or "",
-                pdf_data.get(f"{prefix}_state", "") or "",
-                pdf_data.get(f"{prefix}_zip", "") or "",
+                pdf_data.get(f"{prefix}_street") or "",
+                pdf_data.get(f"{prefix}_city_town") or "",
+                pdf_data.get(f"{prefix}_state") or "",
+                pdf_data.get(f"{prefix}_zip") or "",
             ]
             return ", ".join(p.strip() for p in parts if p.strip())
 
@@ -605,7 +612,6 @@ class MacBackfillScraper:
         if p2:
             result.update(p2)
         if not result:
-            # Extraction failed — flag for manual review rather than skipping
             result["has_real_property"] = True
             result["real_property_value_raw"] = "unknown (screenshot extraction failed)"
             result["real_property_value_dollars"] = None
@@ -616,18 +622,49 @@ class MacBackfillScraper:
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
+def print_setup_instructions():
+    print("""
+╔══════════════════════════════════════════════════════════════════════╗
+║          NY PROBATE BACKFILL — MAC LOCAL RUNNER                      ║
+║          Connects to YOUR Chrome via Chrome DevTools Protocol        ║
+╠══════════════════════════════════════════════════════════════════════╣
+║                                                                      ║
+║  BEFORE RUNNING THIS SCRIPT, complete these steps:                   ║
+║                                                                      ║
+║  STEP 1 — Quit Chrome completely (Cmd+Q), then run this command      ║
+║           in Terminal to relaunch Chrome with remote debugging:      ║
+║                                                                      ║
+║    /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome \\  ║
+║        --remote-debugging-port=9222                                  ║
+║                                                                      ║
+║  STEP 2 — In the Chrome window that opens, navigate to:              ║
+║    https://websurrogates.nycourts.gov/File/FileSearch                ║
+║                                                                      ║
+║    Complete any Cloudflare challenge. Once you see the               ║
+║    File Search form, come back here.                                 ║
+║                                                                      ║
+║  STEP 3 — Press Enter below to connect and start the backfill.       ║
+║                                                                      ║
+╚══════════════════════════════════════════════════════════════════════╝
+""", flush=True)
+
+
 def main():
-    print("=" * 70, flush=True)
-    print("  NY PROBATE BACKFILL — MAC LOCAL RUNNER (VISIBLE BROWSER)", flush=True)
-    print(f"  Progress file : {PROGRESS_FILE}", flush=True)
-    print(f"  Output CSV    : {CSV_PATH}", flush=True)
-    print(f"  OpenAI        : {'✓ ready' if _OPENAI_AVAILABLE else '✗ OPENAI_API_KEY not set'}", flush=True)
-    print(f"  SendGrid      : {'✓ ready' if _SENDGRID_API_KEY else '✗ SENDGRID_API_KEY not set'}", flush=True)
-    print("=" * 70, flush=True)
+    print_setup_instructions()
+
+    print(f"  Script dir  : {_SCRIPT_DIR}", flush=True)
+    print(f"  Progress    : {PROGRESS_FILE}", flush=True)
+    print(f"  Output CSV  : {CSV_PATH}", flush=True)
+    print(f"  OpenAI      : {'✓ ready' if _OPENAI_AVAILABLE else '✗ OPENAI_API_KEY not set'}", flush=True)
+    print(f"  SendGrid    : {'✓ ready' if _SENDGRID_API_KEY else '✗ SENDGRID_API_KEY not set'}", flush=True)
+    print(flush=True)
 
     if not _OPENAI_AVAILABLE:
         print("[mac] ERROR: OPENAI_API_KEY is required for GPT-4o document extraction.", flush=True)
         sys.exit(1)
+
+    input("Press Enter when Chrome is open and you have passed the Cloudflare check... ")
+    print(flush=True)
 
     # Import Playwright
     try:
@@ -665,60 +702,57 @@ def main():
 
     try:
         with sync_playwright() as pw:
-            # ── Launch VISIBLE browser ────────────────────────────────────────
-            browser = pw.chromium.launch(
-                headless=False,          # <-- visible window
-                slow_mo=50,              # slight slowdown so the browser feels natural
-                args=[
-                    "--no-sandbox",
-                    "--disable-blink-features=AutomationControlled",
-                    "--start-maximized",
-                ],
-            )
-            ctx = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-                viewport=None,           # None = use the window's natural size
-                locale="en-US",
-                timezone_id="America/New_York",
-                ignore_https_errors=True,
-            )
-            ctx.add_init_script(
-                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-            )
-            page = ctx.new_page()
+            # ── Connect to existing Chrome via CDP ────────────────────────────
+            print(f"[mac] Connecting to Chrome at {CDP_URL} ...", flush=True)
+            try:
+                browser = pw.chromium.connect_over_cdp(CDP_URL)
+            except Exception as exc:
+                print(f"[mac] ERROR: Could not connect to Chrome at {CDP_URL}", flush=True)
+                print(f"[mac] Details: {exc}", flush=True)
+                print(flush=True)
+                print("[mac] Make sure Chrome was launched with --remote-debugging-port=9222", flush=True)
+                print("[mac] Command:", flush=True)
+                print('[mac]   /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=9222', flush=True)
+                sys.exit(1)
 
-            # ── Navigate to File Search ───────────────────────────────────────
-            print(f"\n[mac] Opening {FILE_SEARCH} in the browser window...", flush=True)
-            page.goto(FILE_SEARCH, wait_until="domcontentloaded", timeout=60000)
+            print("[mac] Connected to Chrome successfully.", flush=True)
 
-            # ── Cloudflare pause ─────────────────────────────────────────────
-            print(f"\n[mac] Waiting {CLOUDFLARE_WAIT} seconds for the page to load...", flush=True)
-            for remaining in range(CLOUDFLARE_WAIT, 0, -1):
-                print(f"\r[mac] {remaining:2d}s remaining... ", end="", flush=True)
-                time.sleep(1)
-            print(flush=True)
+            # Use the first existing browser context (carries the user's session/cookies)
+            contexts = browser.contexts
+            if contexts:
+                ctx = contexts[0]
+                print(f"[mac] Using existing browser context (has {len(ctx.pages)} open tab(s)).", flush=True)
+            else:
+                ctx = browser.new_context()
+                print("[mac] No existing context found — created a new one.", flush=True)
 
-            print("\n" + "=" * 70, flush=True)
-            print("  PLEASE COMPLETE ANY CLOUDFLARE CHALLENGE IN THE BROWSER WINDOW", flush=True)
-            print("  THEN PRESS ENTER IN THIS TERMINAL TO CONTINUE", flush=True)
-            print("=" * 70, flush=True)
-            input()   # blocks until user presses Enter
+            # Use the first open page, or open a new one
+            pages = ctx.pages
+            if pages:
+                page = pages[0]
+                print(f"[mac] Using existing tab: {page.url}", flush=True)
+            else:
+                page = ctx.new_page()
+                print("[mac] No open tabs found — opened a new tab.", flush=True)
 
-            print("[mac] Continuing... checking page status.", flush=True)
-            time.sleep(2)
+            # Verify we can reach File Search
+            print(f"[mac] Navigating to {FILE_SEARCH} ...", flush=True)
+            try:
+                page.goto(FILE_SEARCH, wait_until="domcontentloaded", timeout=60000)
+            except Exception as exc:
+                print(f"[mac] ERROR navigating to File Search: {exc}", flush=True)
+                browser.close()
+                sys.exit(1)
+            time.sleep(REQUEST_DELAY)
 
             if scraper._is_blocked(page):
-                print("[mac] ERROR: Still blocked after manual step. Please try again.", flush=True)
+                print("[mac] ERROR: Cloudflare is blocking the page.", flush=True)
+                print("[mac] Please complete the Cloudflare challenge in Chrome, then run the script again.", flush=True)
                 browser.close()
                 sys.exit(1)
 
-            print("[mac] Page looks good. Starting automated backfill now.", flush=True)
-            print("[mac] The browser window will stay open throughout the run.", flush=True)
-            print("[mac] DO NOT close the browser window until the script finishes.\n", flush=True)
+            print("[mac] File Search page loaded. Starting automated backfill...", flush=True)
+            print("[mac] DO NOT close Chrome until the script finishes.\n", flush=True)
 
             # ── Main backfill loop ────────────────────────────────────────────
             total_blocks = len(TARGET_COURTS) * len(PROCEEDINGS) * len(blocks)
@@ -776,7 +810,8 @@ def main():
                         completed_searches.append(search_key)
                         save_progress(progress)
 
-            print("\n[mac] All blocks processed. Closing browser.", flush=True)
+            print("\n[mac] All blocks processed.", flush=True)
+            # Disconnect cleanly without closing the user's Chrome window
             browser.close()
 
     except KeyboardInterrupt:
