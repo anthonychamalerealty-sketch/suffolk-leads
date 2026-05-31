@@ -60,7 +60,9 @@ except ImportError:
     _OPENAI_AVAILABLE = False
 
 try:
-    from database import SessionLocal, Lead, Contact, Property, init_db, _DB_AVAILABLE
+    from database import SessionLocal, Lead, Contact, Property, init_db
+    from database import engine as _db_engine
+    _DB_AVAILABLE = _db_engine is not None
 except Exception as _e:
     print(f"[backfill] DATABASE IMPORT ERROR: {_e}", flush=True)
     _DB_AVAILABLE = False
@@ -875,6 +877,8 @@ def main():
     if not cookies_json:
         print("[backfill] ERROR: WEBSURROGATES_COOKIES_JSON is not set! Cloudflare bypass will fail.", flush=True)
         sys.exit(1)
+    print("[backfill] REMINDER: WebSurrogates cookies expire daily. "
+          "Please refresh WEBSURROGATES_COOKIES_JSON in Railway variables daily.", flush=True)
 
     # Load progress
     progress = load_progress()
