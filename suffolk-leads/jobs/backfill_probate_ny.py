@@ -375,6 +375,34 @@ def send_email_with_sendgrid(
         return False
 
 
+def sanitize_cookies(cookies):
+    valid_samesite = {'Strict', 'Lax', 'None'}
+    cleaned = []
+    for cookie in cookies:
+        c = {
+            'name': cookie.get('name', ''),
+            'value': cookie.get('value', ''),
+            'domain': cookie.get('domain', ''),
+            'path': cookie.get('path', '/'),
+            'secure': cookie.get('secure', False),
+            'httpOnly': cookie.get('httpOnly', False),
+        }
+        samesite = cookie.get('sameSite', 'Lax')
+        samesite_map = {
+            'no_restriction': 'None',
+            'unspecified': 'Lax',
+            'strict': 'Strict',
+            'lax': 'Lax',
+            'none': 'None',
+        }
+        c['sameSite'] = samesite_map.get(samesite.lower(), 'Lax') if samesite else 'Lax'
+        if cookie.get('expirationDate'):
+            c['expires'] = int(cookie['expirationDate'])
+        cleaned.append(c)
+    return cleaned
+
+
+
 # ── Scraper Class ─────────────────────────────────────────────────────────────
 
 class NYBackfillScraper:
@@ -390,31 +418,8 @@ class NYBackfillScraper:
         if self.cookies_json:
             try:
                 raw = json.loads(self.cookies_json)
-                # Fields that Playwright's add_cookies() does not accept
-                _PLAYWRIGHT_UNSUPPORTED = {"hostOnly", "session", "storeId", "id",
-                                           "sameSite_raw", "expirationDate"}
-                _VALID_SAMESITE = {"Strict", "Lax", "None"}
-                normalised = []
-                for c in raw:
-                    entry = {
-                        "name":   c.get("name", ""),
-                        "value":  c.get("value", ""),
-                        "domain": c.get("domain", ".websurrogates.nycourts.gov"),
-                        "path":   c.get("path", "/"),
-                    }
-                    for k in ("httpOnly", "secure", "sameSite", "expires"):
-                        if k in c:
-                            entry[k] = c[k]
-                    # Sanitize sameSite: must be exactly 'Strict', 'Lax', or 'None'
-                    same_site = entry.get("sameSite")
-                    if same_site not in _VALID_SAMESITE:
-                        entry["sameSite"] = "Lax"
-                    # Remove any fields Playwright does not accept
-                    for bad_key in _PLAYWRIGHT_UNSUPPORTED:
-                        entry.pop(bad_key, None)
-                    normalised.append(entry)
-                self._session_cookies = normalised
-                print(f"[backfill] Parsed {len(normalised)} cookies.", flush=True)
+                self._session_cookies = sanitize_cookies(raw)
+                print(f"[backfill] Parsed {len(self._session_cookies)} cookies.", flush=True)
             except Exception as exc:
                 print(f"[backfill] WARNING: Could not parse cookies: {exc}", flush=True)
 
