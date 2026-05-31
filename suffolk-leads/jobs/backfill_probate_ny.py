@@ -821,6 +821,23 @@ class NYBackfillScraper:
         return None
 
 
+# ── CSV Export Helper ────────────────────────────────────────────────────────
+
+def generate_csv(leads, filepath):
+    import csv
+    try:
+        with open(filepath, 'w', newline='', encoding='utf-8') as f:
+            if not leads:
+                return False
+            writer = csv.DictWriter(f, fieldnames=leads[0].keys())
+            writer.writeheader()
+            writer.writerows(leads)
+        return True
+    except Exception as e:
+        print(f'CSV error: {e}', flush=True)
+        return False
+
+
 # ── Main Backfill Orchestration ───────────────────────────────────────────────
 
 def main():
