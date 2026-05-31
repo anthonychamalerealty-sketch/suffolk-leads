@@ -4,27 +4,28 @@ run_backfill_mac.py
 -------------------
 Standalone Mac backfill script for NY probate records.
 
-Runs DIRECTLY from your home IP — NO proxy required.
-Reads cookies from a cookies.json file in the same folder as this script.
+Runs DIRECTLY from your home IP — NO cookies, NO proxy required.
 
-What it does
+How it works
 ============
-1. Reads cookies.json from the same folder (export with EditThisCookie).
-2. Launches a headless Chromium browser and injects the cookies.
-3. Navigates to https://websurrogates.nycourts.gov/File/FileSearch
-4. Searches Suffolk County and Nassau County Surrogate's Courts.
-5. Loops through 24 monthly date ranges (oldest → newest).
-6. Searches both ADMINISTRATION PETITION and PROBATE PETITION types.
-7. Clicks into each case, opens the petition document.
-8. Uses GPT-4o vision to extract:
-     - Decedent name, address, date of death
-     - Petitioner name, address, phone number, relationship
-     - Section 3(b) real property value
-9. Skips cases where section 3(b) real property value is $0 / blank / NONE.
-10. Saves results to ~/Desktop/backfill_results.csv
-11. Saves progress to backfill_progress.json (same folder as cookies.json)
-    so the script can resume if interrupted — just run it again.
-12. Sends the final CSV to Anthonychamalerealty@gmail.com via SendGrid.
+1. Opens a VISIBLE Chrome browser window (you can see it on screen).
+2. Navigates to https://websurrogates.nycourts.gov/File/FileSearch
+3. Waits 30 seconds and asks you to complete any Cloudflare challenge manually.
+4. Once you press Enter in Terminal, the script takes over and runs
+   automatically for the full 24-month backfill — no more interruptions.
+5. The browser window stays open throughout the entire run.
+
+What it extracts
+================
+- Decedent name, address, date of death
+- Petitioner name, address, phone number, relationship
+- Section 3(b) real property value (skips $0 / NONE cases)
+
+Output
+======
+- ~/Desktop/backfill_results.csv
+- Email sent to Anthonychamalerealty@gmail.com via SendGrid when complete
+- Progress saved to backfill_progress.json (resume if interrupted)
 
 Required environment variables
 ================================
@@ -36,17 +37,7 @@ Usage
   Set the env vars and run:
     python3 run_backfill_mac.py
 
-  Or use the provided run_mac.sh launcher (just double-click it in Finder
-  after making it executable: chmod +x run_mac.sh).
-
-Cookies
-=======
-  Export your websurrogates.nycourts.gov cookies using the EditThisCookie
-  Chrome extension (Export as JSON), then save the file as:
-    cookies.json   (in the same folder as this script)
-
-  Cookies expire every ~24 hours — refresh cookies.json daily if you
-  need to run the script on multiple days.
+  Or double-click run_mac.sh (after filling in your API keys).
 """
 
 from __future__ import annotations
@@ -65,21 +56,23 @@ from typing import Optional
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 _SCRIPT_DIR   = Path(__file__).parent.resolve()
-COOKIES_FILE  = _SCRIPT_DIR / "cookies.json"
 PROGRESS_FILE = _SCRIPT_DIR / "backfill_progress.json"
 DESKTOP       = Path.home() / "Desktop"
 CSV_PATH      = DESKTOP / "backfill_results.csv"
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-BASE_URL       = "https://websurrogates.nycourts.gov"
-FILE_SEARCH    = f"{BASE_URL}/File/FileSearch"
-REQUEST_DELAY  = 3        # seconds between page loads
-MONTHS_BACK    = 24       # how many months of history to backfill
-TARGET_COURTS  = ["Suffolk County Surrogate's Court",
-                  "Nassau County Surrogate's Court"]
-PROCEEDINGS    = ["ADMINISTRATION PETITION", "PROBATE PETITION"]
+BASE_URL        = "https://websurrogates.nycourts.gov"
+FILE_SEARCH     = f"{BASE_URL}/File/FileSearch"
+REQUEST_DELAY   = 3        # seconds between page loads
+MONTHS_BACK     = 24       # how many months of history to backfill
+TARGET_COURTS   = [
+    "Suffolk County Surrogate's Court",
+    "Nassau County Surrogate's Court",
+]
+PROCEEDINGS     = ["ADMINISTRATION PETITION", "PROBATE PETITION"]
 RECIPIENT_EMAIL = "Anthonychamalerealty@gmail.com"
-GPT_MODEL      = "gpt-4o"
+GPT_MODEL       = "gpt-4o"
+CLOUDFLARE_WAIT = 30       # seconds to show the browser before prompting user
 
 # ── Environment ───────────────────────────────────────────────────────────────
 _OPENAI_API_KEY   = os.environ.get("OPENAI_API_KEY", "")
@@ -140,57 +133,6 @@ Rules:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Cookie helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_cookies_from_file(path: Path) -> list[dict]:
-    """Load and sanitize cookies from a JSON file exported by EditThisCookie."""
-    if not path.exists():
-        print(f"[mac] ERROR: cookies.json not found at {path}", flush=True)
-        print("[mac] Export your websurrogates.nycourts.gov cookies using EditThisCookie", flush=True)
-        print("[mac] and save the file as cookies.json in the same folder as this script.", flush=True)
-        sys.exit(1)
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        cookies = sanitize_cookies(raw)
-        print(f"[mac] Loaded {len(cookies)} cookies from {path.name}", flush=True)
-        return cookies
-    except Exception as exc:
-        print(f"[mac] ERROR reading cookies.json: {exc}", flush=True)
-        traceback.print_exc()
-        sys.exit(1)
-
-
-def sanitize_cookies(cookies: list) -> list[dict]:
-    """Convert EditThisCookie export to Playwright-compatible cookie dicts."""
-    valid_samesite = {"Strict", "Lax", "None"}
-    samesite_map = {
-        "no_restriction": "None",
-        "unspecified":    "Lax",
-        "strict":         "Strict",
-        "lax":            "Lax",
-        "none":           "None",
-    }
-    cleaned = []
-    for cookie in cookies:
-        c = {
-            "name":     cookie.get("name", ""),
-            "value":    cookie.get("value", ""),
-            "domain":   cookie.get("domain", ""),
-            "path":     cookie.get("path", "/"),
-            "secure":   cookie.get("secure", False),
-            "httpOnly": cookie.get("httpOnly", False),
-        }
-        ss = cookie.get("sameSite", "Lax") or "Lax"
-        c["sameSite"] = samesite_map.get(ss.lower(), "Lax") if ss not in valid_samesite else ss
-        if cookie.get("expirationDate"):
-            c["expires"] = int(cookie["expirationDate"])
-        cleaned.append(c)
-    return cleaned
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Progress helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -219,7 +161,7 @@ def save_progress(progress: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def write_csv(leads: list[dict], path: Path) -> bool:
-    """Write leads to a CSV file.  Returns True on success."""
+    """Write leads to a CSV file on the Desktop.  Returns True on success."""
     try:
         if not leads:
             print("[mac] No leads to write.", flush=True)
@@ -235,7 +177,7 @@ def write_csv(leads: list[dict], path: Path) -> bool:
                     if rk not in row:
                         row[rk] = rv
             flat_leads.append(row)
-        # Collect all field names preserving order
+        # Collect all field names preserving insertion order
         fieldnames: list[str] = []
         seen: set[str] = set()
         for row in flat_leads:
@@ -263,8 +205,7 @@ def send_email(to_email: str, subject: str, html_body: str,
                attachment_path: Optional[Path] = None,
                attachment_filename: Optional[str] = None) -> bool:
     """Send an email via SendGrid with an optional CSV attachment."""
-    api_key = _SENDGRID_API_KEY
-    if not api_key:
+    if not _SENDGRID_API_KEY:
         print("[mac] WARNING: SENDGRID_API_KEY not set — skipping email.", flush=True)
         return False
     try:
@@ -273,9 +214,8 @@ def send_email(to_email: str, subject: str, html_body: str,
             Mail, Attachment, FileContent, FileName, FileType, Disposition,
         )
     except ImportError:
-        print("[mac] WARNING: sendgrid package not installed — run: pip3 install sendgrid", flush=True)
+        print("[mac] WARNING: sendgrid not installed — run: pip3 install sendgrid", flush=True)
         return False
-
     try:
         message = Mail(
             from_email="Anthonychamalerealty@gmail.com",
@@ -292,7 +232,7 @@ def send_email(to_email: str, subject: str, html_body: str,
                 FileType("text/csv"),
                 Disposition("attachment"),
             )
-        sg = SendGridAPIClient(api_key)
+        sg = SendGridAPIClient(_SENDGRID_API_KEY)
         response = sg.send(message)
         if response.status_code in (200, 202):
             print(f"[mac] Email sent to {to_email} (status {response.status_code})", flush=True)
@@ -311,19 +251,24 @@ def send_email(to_email: str, subject: str, html_body: str,
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MacBackfillScraper:
-    """Runs the WebSurrogates backfill directly from a Mac with no proxy."""
-
-    def __init__(self, session_cookies: list[dict]):
-        self._session_cookies = session_cookies
+    """Runs the WebSurrogates backfill in a visible browser window on Mac."""
 
     # ── Block detection ───────────────────────────────────────────────────────
     def _is_blocked(self, page) -> bool:
-        title = page.title().lower()
-        if "request could not be processed" in title or "just a moment" in title:
-            return True
+        try:
+            title = page.title().lower()
+            if "request could not be processed" in title or "just a moment" in title:
+                return True
+        except Exception:
+            pass
         try:
             body = page.inner_text("body")[:600].lower()
-            if "request could not be processed" in body or "disabling your vpn" in body or "access denied" in body:
+            if any(s in body for s in [
+                "request could not be processed",
+                "disabling your vpn",
+                "access denied",
+                "verify you are human",
+            ]):
                 return True
         except Exception:
             pass
@@ -341,15 +286,14 @@ class MacBackfillScraper:
         time.sleep(REQUEST_DELAY)
 
         if self._is_blocked(page):
-            print("[mac] BLOCKED on File Search — cookies may be expired.", flush=True)
+            print("[mac] BLOCKED on File Search — Cloudflare challenge may have reappeared.", flush=True)
             return []
 
         # Select Court
         try:
             court_sel = page.query_selector("select#Court, select[name='Court']")
             if court_sel:
-                opts = court_sel.query_selector_all("option")
-                for opt in opts:
+                for opt in court_sel.query_selector_all("option"):
                     if court_name.lower() in opt.inner_text().lower():
                         court_sel.select_option(value=opt.get_attribute("value"))
                         print(f"[mac]   Court: {opt.inner_text().strip()}", flush=True)
@@ -363,8 +307,7 @@ class MacBackfillScraper:
         try:
             proc_sel = page.query_selector("select#FileProceeding, select[name='FileProceeding']")
             if proc_sel:
-                opts = proc_sel.query_selector_all("option")
-                for opt in opts:
+                for opt in proc_sel.query_selector_all("option"):
                     if opt.inner_text().strip().upper() == proceeding.upper():
                         proc_sel.select_option(value=opt.get_attribute("value"))
                         print(f"[mac]   Proceeding: {opt.inner_text().strip()}", flush=True)
@@ -387,7 +330,9 @@ class MacBackfillScraper:
 
         # Click Search
         try:
-            btns = page.query_selector_all("input[value='Search'][type='submit'], button:has-text('Search')")
+            btns = page.query_selector_all(
+                "input[value='Search'][type='submit'], button:has-text('Search')"
+            )
             btn = btns[-1] if len(btns) >= 2 else (btns[0] if btns else None)
             if btn:
                 btn.click()
@@ -400,7 +345,7 @@ class MacBackfillScraper:
 
         time.sleep(REQUEST_DELAY)
         if self._is_blocked(page):
-            print("[mac] BLOCKED after search — cookies may be expired.", flush=True)
+            print("[mac] BLOCKED after search.", flush=True)
             return []
 
         return self._parse_results_table(page, proceeding)
@@ -499,7 +444,10 @@ class MacBackfillScraper:
                 if "ADMINISTRATION PETITION" in txt or "PROBATE PETITION" in txt:
                     href = link.get("href", "")
                     if href:
-                        pdf_url = href if href.startswith("http") else BASE_URL + (href if href.startswith("/") else "/" + href)
+                        pdf_url = (
+                            href if href.startswith("http")
+                            else BASE_URL + (href if href.startswith("/") else "/" + href)
+                        )
                         break
         except Exception as exc:
             print(f"[mac] PDF link search warning for {file_number}: {exc}", flush=True)
@@ -525,17 +473,17 @@ class MacBackfillScraper:
         # Build addresses
         def _addr(prefix: str) -> str:
             parts = [
-                pdf_data.get(f"{prefix}_street", ""),
-                pdf_data.get(f"{prefix}_city_town", ""),
-                pdf_data.get(f"{prefix}_state", ""),
-                pdf_data.get(f"{prefix}_zip", ""),
+                pdf_data.get(f"{prefix}_street", "") or "",
+                pdf_data.get(f"{prefix}_city_town", "") or "",
+                pdf_data.get(f"{prefix}_state", "") or "",
+                pdf_data.get(f"{prefix}_zip", "") or "",
             ]
-            return ", ".join(p.strip() for p in parts if p and p.strip())
+            return ", ".join(p.strip() for p in parts if p.strip())
 
-        petitioner_name    = pdf_data.get("petitioner_name", "")
+        petitioner_name    = pdf_data.get("petitioner_name") or ""
         petitioner_address = _addr("petitioner")
         decedent_address   = _addr("decedent") or f"{filing['decedent_name']} — {county} County, NY"
-        phone              = pdf_data.get("petitioner_phone", "")
+        phone              = pdf_data.get("petitioner_phone") or ""
 
         raw_data = {
             "file_number":             filing["file_number"],
@@ -546,13 +494,13 @@ class MacBackfillScraper:
             "decedent_name":           pdf_data.get("decedent_name") or filing["decedent_name"],
             "decedent_address":        decedent_address,
             "date_of_death":           pdf_data.get("date_of_death") or filing.get("dod", ""),
-            "township":                pdf_data.get("township", ""),
+            "township":                pdf_data.get("township") or "",
             "county":                  county,
-            "place_of_death":          pdf_data.get("place_of_death", ""),
+            "place_of_death":          pdf_data.get("place_of_death") or "",
             "petitioner_name":         petitioner_name,
             "petitioner_address":      petitioner_address,
             "petitioner_phone":        phone,
-            "petitioner_relationship": pdf_data.get("petitioner_relationship", ""),
+            "petitioner_relationship": pdf_data.get("petitioner_relationship") or "",
             "real_property_value":     prop_dollars,
             "real_property_value_raw": raw_val,
             "parties":                 json.dumps(parties),
@@ -563,7 +511,7 @@ class MacBackfillScraper:
             "state":      "NY",
             "county":     county,
             "owner_name": petitioner_name or "Unknown",
-            "phone":      phone or "",
+            "phone":      phone,
             "email":      "",
             "source":     "probate",
             "score":      self._score(pdf_data),
@@ -571,7 +519,11 @@ class MacBackfillScraper:
             "status":     "new",
             "raw_data":   raw_data,
         }
-        print(f"[mac] LEAD SAVED: {file_number} | {decedent_address} | phone={phone or '(none)'}", flush=True)
+        print(
+            f"[mac] LEAD SAVED: {file_number} | {decedent_address} | "
+            f"phone={phone or '(none)'} | prop=${prop_dollars}",
+            flush=True,
+        )
         return lead
 
     def _score(self, pdf_data: dict) -> float:
@@ -640,7 +592,7 @@ class MacBackfillScraper:
 
     def _extract_document(self, page, doc_url: str, file_number: str) -> Optional[dict]:
         if not _OPENAI_AVAILABLE:
-            print(f"[mac] Skipping GPT-4o extraction — OPENAI_API_KEY not set.", flush=True)
+            print("[mac] Skipping GPT-4o extraction — OPENAI_API_KEY not set.", flush=True)
             return None
         b64 = self._screenshot_document_page(page, doc_url, file_number)
         if not b64:
@@ -653,7 +605,7 @@ class MacBackfillScraper:
         if p2:
             result.update(p2)
         if not result:
-            # If extraction failed, do not skip — flag for manual review
+            # Extraction failed — flag for manual review rather than skipping
             result["has_real_property"] = True
             result["real_property_value_raw"] = "unknown (screenshot extraction failed)"
             result["real_property_value_dollars"] = None
@@ -666,31 +618,37 @@ class MacBackfillScraper:
 
 def main():
     print("=" * 70, flush=True)
-    print("  NY PROBATE BACKFILL — MAC LOCAL RUNNER", flush=True)
-    print(f"  Script dir : {_SCRIPT_DIR}", flush=True)
-    print(f"  Cookies    : {COOKIES_FILE}", flush=True)
-    print(f"  Progress   : {PROGRESS_FILE}", flush=True)
-    print(f"  Output CSV : {CSV_PATH}", flush=True)
-    print(f"  OpenAI     : {'✓ ready' if _OPENAI_AVAILABLE else '✗ OPENAI_API_KEY not set'}", flush=True)
-    print(f"  SendGrid   : {'✓ ready' if _SENDGRID_API_KEY else '✗ SENDGRID_API_KEY not set'}", flush=True)
+    print("  NY PROBATE BACKFILL — MAC LOCAL RUNNER (VISIBLE BROWSER)", flush=True)
+    print(f"  Progress file : {PROGRESS_FILE}", flush=True)
+    print(f"  Output CSV    : {CSV_PATH}", flush=True)
+    print(f"  OpenAI        : {'✓ ready' if _OPENAI_AVAILABLE else '✗ OPENAI_API_KEY not set'}", flush=True)
+    print(f"  SendGrid      : {'✓ ready' if _SENDGRID_API_KEY else '✗ SENDGRID_API_KEY not set'}", flush=True)
     print("=" * 70, flush=True)
 
     if not _OPENAI_AVAILABLE:
         print("[mac] ERROR: OPENAI_API_KEY is required for GPT-4o document extraction.", flush=True)
         sys.exit(1)
 
-    # Load cookies
-    session_cookies = load_cookies_from_file(COOKIES_FILE)
+    # Import Playwright
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("[mac] ERROR: playwright not installed.", flush=True)
+        print("[mac] Run: pip3 install playwright && playwright install chromium", flush=True)
+        sys.exit(1)
 
     # Load / initialise progress
-    progress          = load_progress()
+    progress           = load_progress()
     completed_searches = progress.setdefault("completed_searches", [])
-    processed_files   = progress.setdefault("processed_files", {})
-    saved_leads       = progress.setdefault("saved_leads", [])
+    processed_files    = progress.setdefault("processed_files", {})
+    saved_leads        = progress.setdefault("saved_leads", [])
 
-    print(f"[mac] Progress: {len(completed_searches)} searches done, "
-          f"{len(processed_files)} files processed, "
-          f"{len(saved_leads)} leads saved so far.", flush=True)
+    print(
+        f"[mac] Progress: {len(completed_searches)} searches done, "
+        f"{len(processed_files)} files processed, "
+        f"{len(saved_leads)} leads saved so far.",
+        flush=True,
+    )
 
     # Build 24 monthly date blocks (oldest → newest)
     today = datetime.date.today()
@@ -701,25 +659,21 @@ def main():
         blocks.append((curr_start, curr_end))
         curr_end = curr_start - datetime.timedelta(days=1)
     blocks.reverse()
-
     print(f"[mac] Date blocks: {len(blocks)} (covering ~{MONTHS_BACK} months)", flush=True)
 
-    # Import Playwright
-    try:
-        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-    except ImportError:
-        print("[mac] ERROR: playwright not installed.", flush=True)
-        print("[mac] Run: pip3 install playwright && playwright install chromium", flush=True)
-        sys.exit(1)
-
-    scraper = MacBackfillScraper(session_cookies)
+    scraper = MacBackfillScraper()
 
     try:
         with sync_playwright() as pw:
+            # ── Launch VISIBLE browser ────────────────────────────────────────
             browser = pw.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage",
-                      "--disable-blink-features=AutomationControlled"],
+                headless=False,          # <-- visible window
+                slow_mo=50,              # slight slowdown so the browser feels natural
+                args=[
+                    "--no-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--start-maximized",
+                ],
             )
             ctx = browser.new_context(
                 user_agent=(
@@ -727,7 +681,7 @@ def main():
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/124.0.0.0 Safari/537.36"
                 ),
-                viewport={"width": 1280, "height": 900},
+                viewport=None,           # None = use the window's natural size
                 locale="en-US",
                 timezone_id="America/New_York",
                 ignore_https_errors=True,
@@ -735,26 +689,38 @@ def main():
             ctx.add_init_script(
                 "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
             )
-            if session_cookies:
-                ctx.add_cookies(session_cookies)
-                print(f"[mac] Injected {len(session_cookies)} cookies.", flush=True)
-
             page = ctx.new_page()
 
-            # Navigate directly to File Search (public site — no login needed)
-            print("[mac] Navigating to File Search...", flush=True)
+            # ── Navigate to File Search ───────────────────────────────────────
+            print(f"\n[mac] Opening {FILE_SEARCH} in the browser window...", flush=True)
             page.goto(FILE_SEARCH, wait_until="domcontentloaded", timeout=60000)
-            time.sleep(REQUEST_DELAY)
+
+            # ── Cloudflare pause ─────────────────────────────────────────────
+            print(f"\n[mac] Waiting {CLOUDFLARE_WAIT} seconds for the page to load...", flush=True)
+            for remaining in range(CLOUDFLARE_WAIT, 0, -1):
+                print(f"\r[mac] {remaining:2d}s remaining... ", end="", flush=True)
+                time.sleep(1)
+            print(flush=True)
+
+            print("\n" + "=" * 70, flush=True)
+            print("  PLEASE COMPLETE ANY CLOUDFLARE CHALLENGE IN THE BROWSER WINDOW", flush=True)
+            print("  THEN PRESS ENTER IN THIS TERMINAL TO CONTINUE", flush=True)
+            print("=" * 70, flush=True)
+            input()   # blocks until user presses Enter
+
+            print("[mac] Continuing... checking page status.", flush=True)
+            time.sleep(2)
 
             if scraper._is_blocked(page):
-                print("[mac] ERROR: Blocked on File Search. Cookies may be expired.", flush=True)
-                print("[mac] Please refresh cookies.json and try again.", flush=True)
+                print("[mac] ERROR: Still blocked after manual step. Please try again.", flush=True)
                 browser.close()
                 sys.exit(1)
 
-            print("[mac] Connected to WebSurrogates File Search. Starting backfill...", flush=True)
+            print("[mac] Page looks good. Starting automated backfill now.", flush=True)
+            print("[mac] The browser window will stay open throughout the run.", flush=True)
+            print("[mac] DO NOT close the browser window until the script finishes.\n", flush=True)
 
-            # Main loop
+            # ── Main backfill loop ────────────────────────────────────────────
             total_blocks = len(TARGET_COURTS) * len(PROCEEDINGS) * len(blocks)
             block_num = 0
 
@@ -762,18 +728,27 @@ def main():
                 county = "Suffolk" if "Suffolk" in court else "Nassau"
                 for proceeding in PROCEEDINGS:
                     for start_date, end_date in blocks:
-                        start_str = start_date.strftime("%m/%d/%Y")
-                        end_str   = end_date.strftime("%m/%d/%Y")
+                        start_str  = start_date.strftime("%m/%d/%Y")
+                        end_str    = end_date.strftime("%m/%d/%Y")
                         search_key = f"{court}|{proceeding}|{start_str}|{end_str}"
                         block_num += 1
 
                         if search_key in completed_searches:
-                            print(f"[mac] Skipping completed block ({block_num}/{total_blocks}): {search_key}", flush=True)
+                            print(
+                                f"[mac] Skipping completed block "
+                                f"({block_num}/{total_blocks}): {search_key}",
+                                flush=True,
+                            )
                             continue
 
-                        print(f"\n[mac] Block {block_num}/{total_blocks}: {search_key}", flush=True)
+                        print(
+                            f"\n[mac] Block {block_num}/{total_blocks}: {search_key}",
+                            flush=True,
+                        )
 
-                        filings = scraper.search_filings(page, court, proceeding, start_str, end_str)
+                        filings = scraper.search_filings(
+                            page, court, proceeding, start_str, end_str
+                        )
 
                         for filing in filings:
                             file_num = filing["file_number"]
@@ -790,7 +765,9 @@ def main():
                             except Exception as exc:
                                 print(f"[mac] ERROR processing {file_num}: {exc}", flush=True)
                                 traceback.print_exc()
-                                processed_files[file_num] = {"status": "error", "error": str(exc)}
+                                processed_files[file_num] = {
+                                    "status": "error", "error": str(exc)
+                                }
 
                             # Save progress every 5 filings
                             if len(processed_files) % 5 == 0:
@@ -799,6 +776,7 @@ def main():
                         completed_searches.append(search_key)
                         save_progress(progress)
 
+            print("\n[mac] All blocks processed. Closing browser.", flush=True)
             browser.close()
 
     except KeyboardInterrupt:
@@ -818,8 +796,8 @@ def main():
 
     # Send email
     if csv_ok:
-        date_str = datetime.datetime.now().strftime("%Y-%m-%d")
-        subject  = f"NY Probate Backfill Complete — {len(saved_leads)} Leads — {date_str}"
+        date_str  = datetime.datetime.now().strftime("%Y-%m-%d")
+        subject   = f"NY Probate Backfill Complete — {len(saved_leads)} Leads — {date_str}"
         html_body = f"""<!DOCTYPE html>
 <html>
 <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; padding: 20px;">
@@ -827,22 +805,24 @@ def main():
     NY Probate Historical Backfill — Mac Local Run
   </h2>
   <p>Hello Anthony,</p>
-  <p>The local Mac backfill job has completed.</p>
-  <table style="border-collapse: collapse; width: 100%; max-width: 500px;">
-    <tr><td style="padding: 6px; font-weight: bold;">Date range covered:</td>
-        <td style="padding: 6px;">Last {MONTHS_BACK} months</td></tr>
-    <tr style="background:#f9f9f9"><td style="padding: 6px; font-weight: bold;">Courts searched:</td>
-        <td style="padding: 6px;">Suffolk County, Nassau County</td></tr>
-    <tr><td style="padding: 6px; font-weight: bold;">Proceeding types:</td>
-        <td style="padding: 6px;">Administration Petition, Probate Petition</td></tr>
-    <tr style="background:#f9f9f9"><td style="padding: 6px; font-weight: bold;">Total leads saved:</td>
-        <td style="padding: 6px;"><strong>{len(saved_leads)}</strong></td></tr>
-    <tr><td style="padding: 6px; font-weight: bold;">Filter applied:</td>
-        <td style="padding: 6px;">Skipped cases where section 3(b) real property = $0 or NONE</td></tr>
+  <p>The local Mac backfill job has completed successfully.</p>
+  <table style="border-collapse: collapse; width: 100%; max-width: 520px;">
+    <tr><td style="padding:6px;font-weight:bold;">Date range:</td>
+        <td style="padding:6px;">Last {MONTHS_BACK} months</td></tr>
+    <tr style="background:#f9f9f9">
+        <td style="padding:6px;font-weight:bold;">Courts:</td>
+        <td style="padding:6px;">Suffolk County, Nassau County</td></tr>
+    <tr><td style="padding:6px;font-weight:bold;">Proceeding types:</td>
+        <td style="padding:6px;">Administration Petition, Probate Petition</td></tr>
+    <tr style="background:#f9f9f9">
+        <td style="padding:6px;font-weight:bold;">Total leads saved:</td>
+        <td style="padding:6px;"><strong>{len(saved_leads)}</strong></td></tr>
+    <tr><td style="padding:6px;font-weight:bold;">Filter:</td>
+        <td style="padding:6px;">Skipped cases where section 3(b) real property = $0 or NONE</td></tr>
   </table>
   <p>The full export is attached as a CSV file.</p>
-  <hr style="border: none; border-top: 1px solid #eee; margin-top: 20px;">
-  <p style="font-size: 12px; color: #7f8c8d;">
+  <hr style="border:none;border-top:1px solid #eee;margin-top:20px;">
+  <p style="font-size:12px;color:#7f8c8d;">
     Generated by run_backfill_mac.py on {datetime.datetime.now().strftime("%Y-%m-%d %H:%M")}
   </p>
 </body>
