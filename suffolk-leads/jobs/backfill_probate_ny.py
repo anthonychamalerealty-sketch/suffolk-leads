@@ -45,27 +45,57 @@ except ImportError:
     print("[backfill] ERROR: playwright is required.", flush=True)
     _PLAYWRIGHT_AVAILABLE = False
 
-try:
-    from pdf2image import convert_from_bytes
-    _PDF2IMAGE_AVAILABLE = True
-except ImportError:
-    print("[backfill] WARNING: pdf2image not installed.", flush=True)
-    _PDF2IMAGE_AVAILABLE = False
+# OpenAI API key (used via requests — no openai SDK needed)
+_OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+_OPENAI_AVAILABLE = bool(_OPENAI_API_KEY)
+if not _OPENAI_AVAILABLE:
+    print("[backfill] WARNING: OPENAI_API_KEY not set — GPT-4o extraction disabled.", flush=True)
 
-try:
-    from openai import OpenAI
-    _OPENAI_AVAILABLE = True
-except ImportError:
-    print("[backfill] WARNING: openai not installed.", flush=True)
-    _OPENAI_AVAILABLE = False
+import sqlite3
+DB_PATH = os.environ.get('DB_PATH', '/app/sql_app.db')
 
-try:
-    from database import SessionLocal, Lead, Contact, Property, init_db
-    from database import engine as _db_engine
-    _DB_AVAILABLE = _db_engine is not None
-except Exception as _e:
-    print(f"[backfill] DATABASE IMPORT ERROR: {_e}", flush=True)
-    _DB_AVAILABLE = False
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def _ensure_db_tables():
+    """Create leads and contacts tables if they don't exist yet."""
+    try:
+        conn = get_db()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS leads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                address TEXT,
+                parcel_id TEXT,
+                source TEXT,
+                raw_data TEXT,
+                score REAL,
+                created_at TEXT,
+                status TEXT DEFAULT 'new',
+                state TEXT DEFAULT 'NY',
+                county TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS contacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lead_id INTEGER,
+                owner_name TEXT,
+                phone TEXT,
+                email TEXT,
+                source TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+        print(f"[backfill] SQLite DB ready at {DB_PATH}", flush=True)
+        return True
+    except Exception as exc:
+        print(f"[backfill] DB setup warning: {exc}", flush=True)
+        return False
+
+_DB_AVAILABLE = _ensure_db_tables()
 
 # Logging setup
 logging.basicConfig(
@@ -351,17 +381,9 @@ class NYBackfillScraper:
     def __init__(self, cookies_json: str, limit: Optional[int] = None):
         self.cookies_json = cookies_json
         self.limit = limit
-        self._openai: Optional[OpenAI] = None
         self._session_cookies: list[dict] = []
         self._blocked = False
         self.processed_this_run = 0
-
-        if _OPENAI_AVAILABLE:
-            try:
-                self._openai = OpenAI()
-            except Exception as exc:
-                print(f"[backfill] OpenAI initialization failed: {exc}", flush=True)
-
         self._parse_cookies()
 
     def _parse_cookies(self):
@@ -616,19 +638,13 @@ class NYBackfillScraper:
             print(f"[backfill] PDF link search warning: {exc}", flush=True)
 
         if not pdf_url:
-            print(f"[backfill] No petition PDF link found for {file_number}", flush=True)
+            print(f"[backfill] No petition document link found for {file_number}", flush=True)
             return None
 
-        # Download PDF
-        pdf_bytes = self._download_pdf(page, pdf_url)
-        if not pdf_bytes:
-            print(f"[backfill] PDF download failed for {file_number}", flush=True)
-            return None
-
-        # Extract data with GPT-4o
-        pdf_data = self._extract_pdf(pdf_bytes, file_number)
+        # Screenshot the document preview page and extract data with GPT-4o
+        pdf_data = self._extract_document(page, pdf_url, file_number)
         if not pdf_data:
-            print(f"[backfill] PDF extraction failed for {file_number}", flush=True)
+            print(f"[backfill] Document extraction failed for {file_number}", flush=True)
             return None
 
         # Section 3(b) Filter: skip cases where real property value is zero/NONE/blank
@@ -701,137 +717,133 @@ class NYBackfillScraper:
             "raw_data": raw_data
         }
 
-        # Save to Database
+        # Save to Database (raw sqlite3)
         if _DB_AVAILABLE:
             try:
-                db = SessionLocal()
-                # Dedup
+                conn = get_db()
                 _fn = filing["file_number"]
-                existing = db.query(Lead).filter(
-                    Lead.source == "probate",
-                    Lead.raw_data.like(f"%{_fn}%")
-                ).first()
-                if existing:
-                    print(f"[backfill] DB Duplicate: {_fn} already exists (lead id={existing.id})", flush=True)
+                # Dedup check
+                row = conn.execute(
+                    "SELECT id FROM leads WHERE source='probate' AND raw_data LIKE ?",
+                    (f"%{_fn}%",)
+                ).fetchone()
+                if row:
+                    print(f"[backfill] DB Duplicate: {_fn} already exists (lead id={row['id']})", flush=True)
                 else:
-                    lead = Lead(
-                        address=decedent_addr,
-                        parcel_id=None,
-                        source="probate",
-                        raw_data=json.dumps(raw_data),
-                        score=lead_dict["score"],
-                        status="new",
-                        state="NY",
-                        county=county,
-                    )
-                    db.add(lead)
-                    db.flush()
-
-                    if petitioner_name:
-                        contact = Contact(
-                            lead_id=lead.id,
-                            owner_name=petitioner_name,
-                            phone=phone,
-                            email=None,
-                            source=phone_source or "petition_document",
+                    cur = conn.execute(
+                        """
+                        INSERT INTO leads (address, parcel_id, source, raw_data, score,
+                                          created_at, status, state, county)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            decedent_addr, None, "probate", json.dumps(raw_data),
+                            lead_dict["score"], lead_dict["created_at"], "new", "NY", county,
                         )
-                        db.add(contact)
-                    db.commit()
-                    print(f"[backfill] Saved to DB: lead id={lead.id}", flush=True)
+                    )
+                    lead_id = cur.lastrowid
+                    if petitioner_name:
+                        conn.execute(
+                            """
+                            INSERT INTO contacts (lead_id, owner_name, phone, email, source)
+                            VALUES (?, ?, ?, ?, ?)
+                            """,
+                            (lead_id, petitioner_name, phone, None,
+                             phone_source or "petition_document")
+                        )
+                    conn.commit()
+                    print(f"[backfill] Saved to DB: lead id={lead_id}", flush=True)
+                conn.close()
             except Exception as exc:
                 print(f"[backfill] DB Save Error: {exc}", flush=True)
                 traceback.print_exc()
-            finally:
-                db.close()
 
         self.processed_this_run += 1
         return lead_dict
 
-    def _download_pdf(self, page, pdf_url: str) -> Optional[bytes]:
-        time.sleep(REQUEST_DELAY)
+    def _screenshot_document_page(self, page, doc_url: str, label: str) -> Optional[str]:
+        """Navigate to a document preview URL, take a full-page screenshot,
+        and return it as a base64-encoded JPEG string."""
         try:
-            resp = page.context.request.get(pdf_url, timeout=30000)
-            if resp.status == 200:
-                body = resp.body()
-                if body[:4] == b"%PDF":
-                    return body
-            print(f"[backfill] Playwright PDF download status: {resp.status}", flush=True)
+            page.goto(doc_url, wait_until="domcontentloaded", timeout=30000)
+            time.sleep(REQUEST_DELAY)
+            png_bytes = page.screenshot(full_page=True)
+            b64 = base64.b64encode(png_bytes).decode()
+            print(f"[backfill] Screenshot captured for {label} ({len(png_bytes)} bytes)", flush=True)
+            return b64
         except Exception as exc:
-            print(f"[backfill] Playwright PDF download error: {exc}", flush=True)
+            print(f"[backfill] Screenshot error for {label}: {exc}", flush=True)
+            return None
 
-        # Fallback with requests
-        try:
-            cookies = {c["name"]: c["value"] for c in page.context.cookies()}
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                "Referer": BASE_URL,
-            }
-            r = requests.get(pdf_url, cookies=cookies, headers=headers, timeout=30)
-            if r.status_code == 200 and r.content[:4] == b"%PDF":
-                return r.content
-            print(f"[backfill] requests PDF download status: {r.status_code}", flush=True)
-        except Exception as exc:
-            print(f"[backfill] requests PDF download error: {exc}", flush=True)
-        return None
-
-    def _extract_pdf(self, pdf_bytes: bytes, file_number: str) -> Optional[dict]:
-        if not _PDF2IMAGE_AVAILABLE or not self._openai:
-            print(f"[backfill] pdf2image or OpenAI not available", flush=True)
+    def _gpt4o_screenshot(self, b64_image: str, prompt: str, label: str) -> Optional[dict]:
+        """Send a base64 screenshot to GPT-4o vision via the OpenAI REST API
+        using the requests library (no openai SDK required)."""
+        if not _OPENAI_AVAILABLE:
+            print(f"[backfill] OpenAI not available for {label}", flush=True)
             return None
         try:
-            images = convert_from_bytes(pdf_bytes, dpi=200, first_page=1, last_page=2)
-            if not images:
-                return None
-
-            result = {}
-            # Page 1
-            p1 = self._gpt4o_page(images[0], _PAGE1_PROMPT, f"{file_number} p1")
-            if p1:
-                result.update(p1)
-
-            # Page 2
-            if len(images) >= 2:
-                p2 = self._gpt4o_page(images[1], _PAGE2_PROMPT, f"{file_number} p2")
-                if p2:
-                    result.update(p2)
-            else:
-                result["has_real_property"] = True
-                result["real_property_value_raw"] = "unknown (single page)"
-                result["real_property_value_dollars"] = None
-
-            return result or None
-        except Exception as exc:
-            print(f"[backfill] PDF extraction error: {exc}", flush=True)
-        return None
-
-    def _gpt4o_page(self, image, prompt: str, label: str) -> Optional[dict]:
-        try:
-            buf = io.BytesIO()
-            image.save(buf, format="JPEG", quality=90)
-            b64 = base64.b64encode(buf.getvalue()).decode()
-
-            resp = self._openai.chat.completions.create(
-                model=GPT_MODEL,
-                messages=[{
+            payload = {
+                "model": GPT_MODEL,
+                "max_tokens": 1000,
+                "temperature": 0,
+                "messages": [{
                     "role": "user",
                     "content": [
                         {"type": "text", "text": prompt},
                         {"type": "image_url", "image_url": {
-                            "url": f"data:image/jpeg;base64,{b64}",
+                            "url": f"data:image/png;base64,{b64_image}",
                             "detail": "high",
                         }},
                     ],
                 }],
-                max_tokens=1000,
-                temperature=0,
+            }
+            headers = {
+                "Authorization": f"Bearer {_OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            resp = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=60,
             )
-            raw = resp.choices[0].message.content.strip()
+            resp.raise_for_status()
+            raw = resp.json()["choices"][0]["message"]["content"].strip()
             raw = re.sub(r"^```(?:json)?\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw).strip()
             return json.loads(raw)
         except Exception as exc:
             print(f"[backfill] GPT-4o error for {label}: {exc}", flush=True)
-        return None
+            return None
+
+    def _extract_document(self, page, doc_url: str, file_number: str) -> Optional[dict]:
+        """Take a screenshot of the document preview page and send it to
+        GPT-4o vision.  Returns the merged extraction dict or None."""
+        if not _OPENAI_AVAILABLE:
+            print(f"[backfill] GPT-4o extraction skipped — OPENAI_API_KEY not set", flush=True)
+            return None
+
+        b64 = self._screenshot_document_page(page, doc_url, file_number)
+        if not b64:
+            return None
+
+        result = {}
+        # Page 1 fields
+        p1 = self._gpt4o_screenshot(b64, _PAGE1_PROMPT, f"{file_number} p1")
+        if p1:
+            result.update(p1)
+
+        # Page 2 fields (same screenshot — full-page capture includes both pages)
+        p2 = self._gpt4o_screenshot(b64, _PAGE2_PROMPT, f"{file_number} p2")
+        if p2:
+            result.update(p2)
+
+        if not result:
+            result["has_real_property"] = True
+            result["real_property_value_raw"] = "unknown (screenshot extraction failed)"
+            result["real_property_value_dollars"] = None
+
+        return result or None
 
 
 # ── CSV Export Helper ────────────────────────────────────────────────────────
@@ -866,12 +878,6 @@ def main():
     print("[backfill] STARTING NY PROBATE HISTORICAL BACKFILL", flush=True)
     print(f"[backfill] Target: {args.months} months | Counties: {args.counties} | Proceedings: {args.proceedings}", flush=True)
     print("[backfill] ============================================================", flush=True)
-
-    if _DB_AVAILABLE:
-        try:
-            init_db()
-        except Exception as exc:
-            print(f"[backfill] Database initialization warning: {exc}", flush=True)
 
     cookies_json = os.getenv("WEBSURROGATES_COOKIES_JSON", "")
     if not cookies_json:

@@ -29,12 +29,6 @@ sendgrid>=6.11,<7.0
 # NOTE: After deploying, run once:  playwright install chromium --with-deps
 playwright>=1.44,<2.0
 
-# PDF rendering (jobs/backfill_probate_ny.py — GPT-4o vision reads petition PDFs)
-pdf2image>=1.17,<2.0
-
-# OpenAI SDK (jobs/backfill_probate_ny.py — GPT-4o vision extraction)
-openai>=1.0,<2.0
-
 # Async HTTP (used by parcel_access.py Georgia scrapers)
 aiohttp>=3.9,<4.0
 
