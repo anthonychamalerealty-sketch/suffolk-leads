@@ -969,16 +969,21 @@ def main():
 
     # Run Playwright search loop
     proxy_list = get_proxy_list()
-    proxies_to_try = proxy_list if proxy_list else [None]
-    print(f"[backfill] Proxy pool: {len(proxies_to_try)} proxy(ies) available.", flush=True)
+    # Always append None as a last-resort direct (no-proxy) attempt
+    proxies_to_try = proxy_list + [None] if proxy_list else [None]
+    print(f"[backfill] Proxy pool: {len(proxy_list)} proxy(ies) + 1 direct fallback.", flush=True)
 
     browser = None
     page = None
     _pw_instance = None
 
     for _proxy_idx, _proxy_cfg in enumerate(proxies_to_try):
-        _proxy_label = _proxy_cfg['server'] if _proxy_cfg else 'direct'
-        print(f"[backfill] Trying proxy {_proxy_idx + 1}/{len(proxies_to_try)}: {_proxy_label}", flush=True)
+        _proxy_label = _proxy_cfg['server'] if _proxy_cfg else 'direct (no proxy)'
+        print(f"[backfill] Attempt {_proxy_idx + 1}/{len(proxies_to_try)}: {_proxy_label}", flush=True)
+        # Wait 10 seconds between attempts to avoid hammering the site
+        if _proxy_idx > 0:
+            print(f"[backfill] Waiting 10s before next attempt...", flush=True)
+            time.sleep(10)
         try:
             _pw_instance = sync_playwright().start()
             browser = _pw_instance.chromium.launch(
@@ -999,20 +1004,21 @@ def main():
             page = ctx.new_page()
             # websurrogates.nycourts.gov is a public site — no login needed.
             # Navigate directly to File Search; cookies handle Cloudflare bypass.
+            # Use a 60s timeout to avoid prematurely flagging slow proxies as blocked.
             print(f"[backfill] Navigating directly to File Search via {_proxy_label}", flush=True)
-            page.goto(FILE_SEARCH, wait_until="domcontentloaded", timeout=30000)
+            page.goto(FILE_SEARCH, wait_until="domcontentloaded", timeout=60000)
             time.sleep(REQUEST_DELAY)
             if scraper._is_blocked(page):
-                print(f"[backfill] Blocked via {_proxy_label} — trying next proxy.", flush=True)
+                print(f"[backfill] Blocked via {_proxy_label} — trying next.", flush=True)
                 browser.close()
                 _pw_instance.stop()
                 browser = None
                 page = None
                 continue
             print(f"[backfill] Connected successfully via {_proxy_label}.", flush=True)
-            break  # good proxy — proceed with scrape
+            break  # good connection — proceed with scrape
         except Exception as _proxy_err:
-            print(f"[backfill] Proxy {_proxy_label} failed: {_proxy_err}", flush=True)
+            print(f"[backfill] {_proxy_label} failed: {_proxy_err}", flush=True)
             if browser:
                 try:
                     browser.close()
@@ -1027,7 +1033,7 @@ def main():
             page = None
 
     if browser is None or page is None:
-        print("[backfill] All proxies failed or are blocked. Exiting.", flush=True)
+        print("[backfill] All proxies and direct connection failed or are blocked. Exiting.", flush=True)
         sys.exit(1)
 
     try:
