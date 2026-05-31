@@ -366,6 +366,10 @@ class NYBackfillScraper:
         if self.cookies_json:
             try:
                 raw = json.loads(self.cookies_json)
+                # Fields that Playwright's add_cookies() does not accept
+                _PLAYWRIGHT_UNSUPPORTED = {"hostOnly", "session", "storeId", "id",
+                                           "sameSite_raw", "expirationDate"}
+                _VALID_SAMESITE = {"Strict", "Lax", "None"}
                 normalised = []
                 for c in raw:
                     entry = {
@@ -374,9 +378,16 @@ class NYBackfillScraper:
                         "domain": c.get("domain", ".websurrogates.nycourts.gov"),
                         "path":   c.get("path", "/"),
                     }
-                    for k in ("httpOnly", "secure", "sameSite"):
+                    for k in ("httpOnly", "secure", "sameSite", "expires"):
                         if k in c:
                             entry[k] = c[k]
+                    # Sanitize sameSite: must be exactly 'Strict', 'Lax', or 'None'
+                    same_site = entry.get("sameSite")
+                    if same_site not in _VALID_SAMESITE:
+                        entry["sameSite"] = "Lax"
+                    # Remove any fields Playwright does not accept
+                    for bad_key in _PLAYWRIGHT_UNSUPPORTED:
+                        entry.pop(bad_key, None)
                     normalised.append(entry)
                 self._session_cookies = normalised
                 print(f"[backfill] Parsed {len(normalised)} cookies.", flush=True)
