@@ -214,63 +214,61 @@ def scrape_truepeoplesearch_sync(name: str, address: str) -> list[str]:
     print(f"[enrich] TruePeopleSearch URL: {search_url}", flush=True)
     
     phones = []
-    try:
-        proxy_config = None
-        proxy_host = os.environ.get('PROXY_HOST')
-        proxy_port = os.environ.get('PROXY_PORT')
-        proxy_user = os.environ.get('PROXY_USERNAME')
-        proxy_pass = os.environ.get('PROXY_PASSWORD')
-        if proxy_host and proxy_port:
-            proxy_config = {
-                'server': f'http://{proxy_host}:{proxy_port}',
-                'username': proxy_user,
-                'password': proxy_pass,
-            }
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True, proxy=proxy_config)
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                viewport={"width": random.randint(1280, 1920), "height": random.randint(768, 1080)},
-                locale="en-US",
-                timezone_id="America/New_York",
-            )
-            context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-            page = context.new_page()
+    proxy_list = get_proxy_list()
+    proxies_to_try = proxy_list if proxy_list else [None]
+    for _proxy_idx, _proxy_cfg in enumerate(proxies_to_try):
+        _proxy_label = _proxy_cfg['server'] if _proxy_cfg else 'direct'
+        print(f"[enrich] TruePeopleSearch attempt {_proxy_idx + 1}/{len(proxies_to_try)} via {_proxy_label}", flush=True)
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(headless=True, proxy=_proxy_cfg)
+                context = browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    viewport={"width": random.randint(1280, 1920), "height": random.randint(768, 1080)},
+                    locale="en-US",
+                    timezone_id="America/New_York",
+                )
+                context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+                page = context.new_page()
             
-            try:
-                page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
-                time.sleep(random.uniform(2.0, 4.0))
-                content = page.content()
-                
-                if any(sig in content.lower() for sig in ["captcha", "recaptcha", "cloudflare", "just a moment", "verify you are human"]):
-                    print(f"[enrich] CAPTCHA detected on TruePeopleSearch for '{name}'", flush=True)
-                    return []
-                    
-                # Try to click the first profile
                 try:
-                    profile_link = page.query_selector("a[href*='/find/person/'], a[href*='/results/'], .card-summary a")
-                    if profile_link:
-                        href = profile_link.get_attribute("href")
-                        if href and not href.startswith("http"):
-                            href = "https://www.truepeoplesearch.com" + href
-                        print(f"[enrich] TruePeopleSearch: clicking profile {href}", flush=True)
-                        page.goto(href, wait_until="domcontentloaded", timeout=30000)
-                        time.sleep(random.uniform(3.0, 5.0))
-                        content = page.content()
-                except Exception as _link_err:
-                    print(f"[enrich] TruePeopleSearch profile click failed: {_link_err}", flush=True)
-                    
-                # Extract phones
-                phones = _extract_phones_from_html(content)
-                print(f"[enrich] TruePeopleSearch: {len(phones)} phone(s) found for '{name}'", flush=True)
-                
-            except Exception as exc:
-                print(f"[enrich] TruePeopleSearch page error: {exc}", flush=True)
-            finally:
-                browser.close()
-    except Exception as exc:
-        print(f"[enrich] Playwright TruePeopleSearch error: {exc}", flush=True)
-        
+                    page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+                    time.sleep(random.uniform(2.0, 4.0))
+                    content = page.content()
+
+                    if any(sig in content.lower() for sig in ["captcha", "recaptcha", "cloudflare", "just a moment", "verify you are human"]):
+                        print(f"[enrich] CAPTCHA/block detected via {_proxy_label} — trying next proxy", flush=True)
+                        browser.close()
+                        continue
+
+                    # Try to click the first profile
+                    try:
+                        profile_link = page.query_selector("a[href*='/find/person/'], a[href*='/results/'], .card-summary a")
+                        if profile_link:
+                            href = profile_link.get_attribute("href")
+                            if href and not href.startswith("http"):
+                                href = "https://www.truepeoplesearch.com" + href
+                            print(f"[enrich] TruePeopleSearch: clicking profile {href}", flush=True)
+                            page.goto(href, wait_until="domcontentloaded", timeout=30000)
+                            time.sleep(random.uniform(3.0, 5.0))
+                            content = page.content()
+                    except Exception as _link_err:
+                        print(f"[enrich] TruePeopleSearch profile click failed: {_link_err}", flush=True)
+
+                    # Extract phones
+                    phones = _extract_phones_from_html(content)
+                    print(f"[enrich] TruePeopleSearch: {len(phones)} phone(s) found for '{name}'", flush=True)
+
+                except Exception as exc:
+                    print(f"[enrich] TruePeopleSearch page error via {_proxy_label}: {exc}", flush=True)
+                finally:
+                    browser.close()
+
+                break  # success — stop trying more proxies
+
+        except Exception as exc:
+            print(f"[enrich] Playwright launch error via {_proxy_label}: {exc}", flush=True)
+
     return phones
 
 
@@ -381,6 +379,51 @@ def send_email_with_sendgrid(
     except Exception as exc:
         print(f"[EMAIL] SendGrid API error: {exc}", flush=True)
         return False
+
+
+
+def get_proxy_list():
+    """Return a list of proxy config dicts from PROXY_LIST env var.
+
+    PROXY_LIST format: comma-separated entries of IP:PORT:USER:PASS
+    e.g. "1.2.3.4:8080:user1:pass1,5.6.7.8:3128:user2:pass2"
+
+    Falls back to single PROXY_HOST/PROXY_PORT/PROXY_USERNAME/PROXY_PASSWORD
+    env vars if PROXY_LIST is not set.  Returns an empty list if no proxy
+    is configured (browser will connect directly).
+    """
+    raw = os.environ.get('PROXY_LIST', '').strip()
+    proxies = []
+    if raw:
+        for entry in raw.split(','):
+            entry = entry.strip()
+            if not entry:
+                continue
+            parts = entry.split(':')
+            if len(parts) >= 2:
+                host, port = parts[0], parts[1]
+                user = parts[2] if len(parts) > 2 else None
+                pwd  = parts[3] if len(parts) > 3 else None
+                cfg = {'server': f'http://{host}:{port}'}
+                if user:
+                    cfg['username'] = user
+                if pwd:
+                    cfg['password'] = pwd
+                proxies.append(cfg)
+    if not proxies:
+        # Fall back to single-proxy env vars
+        host = os.environ.get('PROXY_HOST')
+        port = os.environ.get('PROXY_PORT')
+        if host and port:
+            cfg = {'server': f'http://{host}:{port}'}
+            user = os.environ.get('PROXY_USERNAME')
+            pwd  = os.environ.get('PROXY_PASSWORD')
+            if user:
+                cfg['username'] = user
+            if pwd:
+                cfg['password'] = pwd
+            proxies.append(cfg)
+    return proxies
 
 
 def sanitize_cookies(cookies):
@@ -925,20 +968,25 @@ def main():
     scraper = NYBackfillScraper(cookies_json=cookies_json, limit=args.limit)
 
     # Run Playwright search loop
-    try:
-        proxy_config = None
-        proxy_host = os.environ.get('PROXY_HOST')
-        proxy_port = os.environ.get('PROXY_PORT')
-        proxy_user = os.environ.get('PROXY_USERNAME')
-        proxy_pass = os.environ.get('PROXY_PASSWORD')
-        if proxy_host and proxy_port:
-            proxy_config = {
-                'server': f'http://{proxy_host}:{proxy_port}',
-                'username': proxy_user,
-                'password': proxy_pass,
-            }
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True, proxy=proxy_config)
+    proxy_list = get_proxy_list()
+    proxies_to_try = proxy_list if proxy_list else [None]
+    print(f"[backfill] Proxy pool: {len(proxies_to_try)} proxy(ies) available.", flush=True)
+
+    browser = None
+    page = None
+    _pw_instance = None
+
+    for _proxy_idx, _proxy_cfg in enumerate(proxies_to_try):
+        _proxy_label = _proxy_cfg['server'] if _proxy_cfg else 'direct'
+        print(f"[backfill] Trying proxy {_proxy_idx + 1}/{len(proxies_to_try)}: {_proxy_label}", flush=True)
+        try:
+            _pw_instance = sync_playwright().start()
+            browser = _pw_instance.chromium.launch(
+                headless=True,
+                proxy=_proxy_cfg,
+                args=["--no-sandbox", "--disable-dev-shm-usage",
+                      "--disable-blink-features=AutomationControlled"],
+            )
             ctx = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                 viewport={"width": 1280, "height": 900},
@@ -946,73 +994,101 @@ def main():
                 timezone_id="America/New_York",
             )
             ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
-            
             if scraper._session_cookies:
                 ctx.add_cookies(scraper._session_cookies)
-
             page = ctx.new_page()
-
-            if not scraper._pass_welcome(page):
-                print("[backfill] Failed to pass Welcome page — cookies may be expired.", flush=True)
+            # websurrogates.nycourts.gov is a public site — no login needed.
+            # Navigate directly to File Search; cookies handle Cloudflare bypass.
+            print(f"[backfill] Navigating directly to File Search via {_proxy_label}", flush=True)
+            page.goto(FILE_SEARCH, wait_until="domcontentloaded", timeout=30000)
+            time.sleep(REQUEST_DELAY)
+            if scraper._is_blocked(page):
+                print(f"[backfill] Blocked via {_proxy_label} — trying next proxy.", flush=True)
                 browser.close()
-                sys.exit(1)
+                _pw_instance.stop()
+                browser = None
+                page = None
+                continue
+            print(f"[backfill] Connected successfully via {_proxy_label}.", flush=True)
+            break  # good proxy — proceed with scrape
+        except Exception as _proxy_err:
+            print(f"[backfill] Proxy {_proxy_label} failed: {_proxy_err}", flush=True)
+            if browser:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+            if _pw_instance:
+                try:
+                    _pw_instance.stop()
+                except Exception:
+                    pass
+            browser = None
+            page = None
 
-            # Loop over search space
-            for county in target_counties:
-                for proceeding in target_proceedings:
-                    for idx, (start_date, end_date) in enumerate(blocks, 1):
-                        
+    if browser is None or page is None:
+        print("[backfill] All proxies failed or are blocked. Exiting.", flush=True)
+        sys.exit(1)
+
+    try:
+        # Loop over search space
+        for county in target_counties:
+            for proceeding in target_proceedings:
+                for idx, (start_date, end_date) in enumerate(blocks, 1):
+
+                    # Limit check
+                    if args.limit and scraper.processed_this_run >= args.limit:
+                        print(f"[backfill] Hit runtime limit of {args.limit} leads. Stopping.", flush=True)
+                        break
+
+                    start_str = start_date.strftime("%m/%d/%Y")
+                    end_str = end_date.strftime("%m/%d/%Y")
+
+                    search_key = f"{county}|{proceeding}|{start_str}|{end_str}"
+                    if search_key in completed_searches:
+                        print(f"[backfill] Skipping completed search block: {search_key}", flush=True)
+                        continue
+
+                    print(f"\n[backfill] Running Block {idx}/{len(blocks)}: {search_key}", flush=True)
+
+                    filings = scraper._search_filings(page, county, proceeding, start_str, end_str)
+                    print(f"[backfill] Found {len(filings)} filing(s) in this block.", flush=True)
+
+                    for filing in filings:
                         # Limit check
                         if args.limit and scraper.processed_this_run >= args.limit:
-                            print(f"[backfill] Hit runtime limit of {args.limit} leads. Stopping.", flush=True)
                             break
 
-                        start_str = start_date.strftime("%m/%d/%Y")
-                        end_str = end_date.strftime("%m/%d/%Y")
-
-                        search_key = f"{county}|{proceeding}|{start_str}|{end_str}"
-                        if search_key in completed_searches:
-                            print(f"[backfill] Skipping completed search block: {search_key}", flush=True)
+                        file_num = filing["file_number"]
+                        if file_num in processed_files:
+                            print(f"[backfill] Filing {file_num} already processed. Skipping.", flush=True)
                             continue
 
-                        print(f"\n[backfill] Running Block {idx}/{len(blocks)}: {search_key}", flush=True)
-                        
-                        filings = scraper._search_filings(page, county, proceeding, start_str, end_str)
-                        print(f"[backfill] Found {len(filings)} filing(s) in this block.", flush=True)
+                        try:
+                            lead_dict = scraper._process_filing(page, filing, county)
+                            if lead_dict:
+                                saved_leads.append(lead_dict)
+                                processed_files[file_num] = {"status": "saved", "decedent": filing["decedent_name"]}
+                                print(f"[backfill] Lead saved successfully for {file_num}", flush=True)
+                            else:
+                                processed_files[file_num] = {"status": "skipped_or_failed"}
+                        except Exception as exc:
+                            print(f"[backfill] Error processing filing {file_num}: {exc}", flush=True)
+                            traceback.print_exc()
+                            processed_files[file_num] = {"status": "error", "error": str(exc)}
 
-                        for filing in filings:
-                            # Limit check
-                            if args.limit and scraper.processed_this_run >= args.limit:
-                                break
+                        # Save progress every 10 processed filings (saved/skipped/error)
+                        if len(processed_files) % 10 == 0:
+                            print("[backfill] Saving incremental progress...", flush=True)
+                            save_progress(progress)
 
-                            file_num = filing["file_number"]
-                            if file_num in processed_files:
-                                print(f"[backfill] Filing {file_num} already processed. Skipping.", flush=True)
-                                continue
+                    # Mark block completed
+                    completed_searches.append(search_key)
+                    save_progress(progress)
 
-                            try:
-                                lead_dict = scraper._process_filing(page, filing, county)
-                                if lead_dict:
-                                    saved_leads.append(lead_dict)
-                                    processed_files[file_num] = {"status": "saved", "decedent": filing["decedent_name"]}
-                                    print(f"[backfill] Lead saved successfully for {file_num}", flush=True)
-                                else:
-                                    processed_files[file_num] = {"status": "skipped_or_failed"}
-                            except Exception as exc:
-                                print(f"[backfill] Error processing filing {file_num}: {exc}", flush=True)
-                                traceback.print_exc()
-                                processed_files[file_num] = {"status": "error", "error": str(exc)}
-
-                            # Save progress every 10 processed filings (saved/skipped/error)
-                            if len(processed_files) % 10 == 0:
-                                print("[backfill] Saving incremental progress...", flush=True)
-                                save_progress(progress)
-
-                        # Mark block completed
-                        completed_searches.append(search_key)
-                        save_progress(progress)
-
-            browser.close()
+        browser.close()
+        if _pw_instance:
+            _pw_instance.stop()
 
     except Exception as exc:
         print(f"[backfill] FATAL CRASH: {exc}", flush=True)

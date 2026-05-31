@@ -188,6 +188,51 @@ Rules:
 """.strip()
 
 
+
+def get_proxy_list():
+    """Return a list of proxy config dicts from PROXY_LIST env var.
+
+    PROXY_LIST format: comma-separated entries of IP:PORT:USER:PASS
+    e.g. "1.2.3.4:8080:user1:pass1,5.6.7.8:3128:user2:pass2"
+
+    Falls back to single PROXY_HOST/PROXY_PORT/PROXY_USERNAME/PROXY_PASSWORD
+    env vars if PROXY_LIST is not set.  Returns an empty list if no proxy
+    is configured (browser will connect directly).
+    """
+    raw = os.environ.get('PROXY_LIST', '').strip()
+    proxies = []
+    if raw:
+        for entry in raw.split(','):
+            entry = entry.strip()
+            if not entry:
+                continue
+            parts = entry.split(':')
+            if len(parts) >= 2:
+                host, port = parts[0], parts[1]
+                user = parts[2] if len(parts) > 2 else None
+                pwd  = parts[3] if len(parts) > 3 else None
+                cfg = {'server': f'http://{host}:{port}'}
+                if user:
+                    cfg['username'] = user
+                if pwd:
+                    cfg['password'] = pwd
+                proxies.append(cfg)
+    if not proxies:
+        # Fall back to single-proxy env vars
+        host = os.environ.get('PROXY_HOST')
+        port = os.environ.get('PROXY_PORT')
+        if host and port:
+            cfg = {'server': f'http://{host}:{port}'}
+            user = os.environ.get('PROXY_USERNAME')
+            pwd  = os.environ.get('PROXY_PASSWORD')
+            if user:
+                cfg['username'] = user
+            if pwd:
+                cfg['password'] = pwd
+            proxies.append(cfg)
+    return proxies
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 class ProbateScraper(BaseScraper):
     """
@@ -236,20 +281,25 @@ class ProbateScraper(BaseScraper):
         saved_filings: list[dict] = []
         total_saved = 0
 
-        try:
-            proxy_config = None
-            proxy_host = os.environ.get('PROXY_HOST')
-            proxy_port = os.environ.get('PROXY_PORT')
-            proxy_user = os.environ.get('PROXY_USERNAME')
-            proxy_pass = os.environ.get('PROXY_PASSWORD')
-            if proxy_host and proxy_port:
-                proxy_config = {
-                    'server': f'http://{proxy_host}:{proxy_port}',
-                    'username': proxy_user,
-                    'password': proxy_pass,
-                }
-            with sync_playwright() as pw:
-                browser = pw.chromium.launch(headless=True, proxy=proxy_config)
+        proxy_list = get_proxy_list()
+        proxies_to_try = proxy_list if proxy_list else [None]
+        print(f"[probate] Proxy pool: {len(proxies_to_try)} proxy(ies) available.", flush=True)
+
+        browser = None
+        page = None
+        _pw_instance = None
+
+        for _proxy_idx, _proxy_cfg in enumerate(proxies_to_try):
+            _proxy_label = _proxy_cfg['server'] if _proxy_cfg else 'direct'
+            print(f"[probate] Trying proxy {_proxy_idx + 1}/{len(proxies_to_try)}: {_proxy_label}", flush=True)
+            try:
+                _pw_instance = sync_playwright().start()
+                browser = _pw_instance.chromium.launch(
+                    headless=True,
+                    proxy=_proxy_cfg,
+                    args=["--no-sandbox", "--disable-dev-shm-usage",
+                          "--disable-blink-features=AutomationControlled"],
+                )
                 ctx = browser.new_context(
                     user_agent=(
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -267,44 +317,72 @@ class ProbateScraper(BaseScraper):
                 if self._session_cookies:
                     ctx.add_cookies(self._session_cookies)
                     print(f"[probate] Injected {len(self._session_cookies)} cookies.", flush=True)
-
                 page = ctx.new_page()
-
-                # Step 1: Pass through Welcome page to get session
-                if not self._pass_welcome(page):
+                # websurrogates.nycourts.gov is a public site — no login needed.
+                # Navigate directly to File Search; cookies handle Cloudflare bypass.
+                print(f"[probate] Navigating directly to File Search via {_proxy_label}", flush=True)
+                page.goto(FILE_SEARCH, wait_until="domcontentloaded", timeout=30000)
+                time.sleep(REQUEST_DELAY)
+                if self._is_blocked(page):
+                    print(f"[probate] Blocked via {_proxy_label} — trying next proxy.", flush=True)
                     browser.close()
-                    print("[probate] Could not pass Welcome page — aborting.", flush=True)
-                    return []
-
-                # Step 2: Run File Information Search for each proceeding type
-                date_from, date_to = self._date_range()
-                print(f"[probate] Search date range: {date_from} → {date_to}", flush=True)
-
-                all_filings: list[dict] = []
-                for proceeding in PROCEEDINGS:
-                    rows = self._search_filings(page, proceeding, date_from, date_to)
-                    print(f"[probate] {proceeding}: {len(rows)} results", flush=True)
-                    all_filings.extend(rows)
-
-                print(f"[probate] Total filings to process: {len(all_filings)}", flush=True)
-
-                # Steps 3–5: Process each filing
-                for i, filing in enumerate(all_filings, 1):
-                    print(f"\n[probate] [{i}/{len(all_filings)}] {filing['file_number']} — {filing['decedent_name']}", flush=True)
+                    _pw_instance.stop()
+                    browser = None
+                    page = None
+                    continue
+                print(f"[probate] Connected successfully via {_proxy_label}.", flush=True)
+                break  # good proxy — proceed with scrape
+            except Exception as _proxy_err:
+                print(f"[probate] Proxy {_proxy_label} failed: {_proxy_err}", flush=True)
+                if browser:
                     try:
-                        saved = self._process_filing(page, filing)
-                        if saved:
-                            total_saved += 1
-                            saved_filings.append(filing)
-                            print(f"[probate]   → LEAD SAVED", flush=True)
-                        else:
-                            print(f"[probate]   → SKIPPED", flush=True)
-                    except Exception as exc:
-                        print(f"[probate]   → ERROR: {exc}", flush=True)
-                        traceback.print_exc()
-                    time.sleep(REQUEST_DELAY)
+                        browser.close()
+                    except Exception:
+                        pass
+                if _pw_instance:
+                    try:
+                        _pw_instance.stop()
+                    except Exception:
+                        pass
+                browser = None
+                page = None
 
-                browser.close()
+        if browser is None or page is None:
+            print("[probate] All proxies failed or are blocked. Saving 0 leads.", flush=True)
+            return []
+
+        try:
+            # Step 2: Run File Information Search for each proceeding type
+            date_from, date_to = self._date_range()
+            print(f"[probate] Search date range: {date_from} → {date_to}", flush=True)
+
+            all_filings: list[dict] = []
+            for proceeding in PROCEEDINGS:
+                rows = self._search_filings(page, proceeding, date_from, date_to)
+                print(f"[probate] {proceeding}: {len(rows)} results", flush=True)
+                all_filings.extend(rows)
+
+            print(f"[probate] Total filings to process: {len(all_filings)}", flush=True)
+
+            # Steps 3–5: Process each filing
+            for i, filing in enumerate(all_filings, 1):
+                print(f"\n[probate] [{i}/{len(all_filings)}] {filing['file_number']} — {filing['decedent_name']}", flush=True)
+                try:
+                    saved = self._process_filing(page, filing)
+                    if saved:
+                        total_saved += 1
+                        saved_filings.append(filing)
+                        print(f"[probate]   → LEAD SAVED", flush=True)
+                    else:
+                        print(f"[probate]   → SKIPPED", flush=True)
+                except Exception as exc:
+                    print(f"[probate]   → ERROR: {exc}", flush=True)
+                    traceback.print_exc()
+                time.sleep(REQUEST_DELAY)
+
+            browser.close()
+            if _pw_instance:
+                _pw_instance.stop()
 
         except Exception as exc:
             print(f"[probate] FATAL ERROR: {exc}", flush=True)
