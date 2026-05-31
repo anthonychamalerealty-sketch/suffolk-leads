@@ -237,15 +237,19 @@ class ProbateScraper(BaseScraper):
         total_saved = 0
 
         try:
+            proxy_config = None
+            proxy_host = os.environ.get('PROXY_HOST')
+            proxy_port = os.environ.get('PROXY_PORT')
+            proxy_user = os.environ.get('PROXY_USERNAME')
+            proxy_pass = os.environ.get('PROXY_PASSWORD')
+            if proxy_host and proxy_port:
+                proxy_config = {
+                    'server': f'http://{proxy_host}:{proxy_port}',
+                    'username': proxy_user,
+                    'password': proxy_pass,
+                }
             with sync_playwright() as pw:
-                browser = pw.chromium.launch(
-                    headless=True,
-                    args=[
-                        "--no-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-blink-features=AutomationControlled",
-                    ],
-                )
+                browser = pw.chromium.launch(headless=True, proxy=proxy_config)
                 ctx = browser.new_context(
                     user_agent=(
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
