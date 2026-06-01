@@ -14,6 +14,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install playwright
 RUN playwright install --with-deps chromium
 
+# Install curl-cffi for Cloudflare bypass (suffolk_backfill.py)
+RUN pip install --no-cache-dir curl-cffi
+
+# Install poppler for pdf2image (PDF → PNG conversion for GPT-4o vision)
+RUN apt-get update && apt-get install -y --no-install-recommends poppler-utils && rm -rf /var/lib/apt/lists/*
+
 # Copy all source code
 COPY . .
 
