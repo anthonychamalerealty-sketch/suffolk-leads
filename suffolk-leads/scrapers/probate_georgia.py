@@ -70,6 +70,7 @@ Env vars required:
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime
 import json
 import os
@@ -78,6 +79,11 @@ import sys
 import time
 import traceback
 from typing import Optional
+
+try:
+    import requests as _requests
+except ImportError:
+    _requests = None
 
 # ── Guarded third-party imports ───────────────────────────────────────────────
 try:
@@ -113,6 +119,31 @@ try:
 except Exception:
     class BaseScraper:
         def scrape(self): pass
+
+# ── OpenAI constants ─────────────────────────────────────────────────────────
+_OPENAI_API_KEY   = os.environ.get("OPENAI_API_KEY", "")
+_OPENAI_AVAILABLE = bool(_OPENAI_API_KEY)
+GPT_MODEL         = "gpt-4o"
+
+GA_DOC_PROMPT = (
+    "Extract from this Georgia probate petition document: "
+    "decedent full name, decedent street address including city state zip, "
+    "date of death, petitioner full name, petitioner street address including "
+    "city state zip, petitioner phone number, petitioner relationship to decedent. "
+    "Return only valid JSON with keys: decedent_name, decedent_address, "
+    "date_of_death, petitioner_name, petitioner_address, petitioner_phone, "
+    "petitioner_relationship"
+)
+
+# Petition document keywords to look for in the Events section
+PETITION_KEYWORDS = [
+    "petition for letters of administration",
+    "petition for probate",
+    "petition",
+    "letters of administration",
+    "probate petition",
+    "application for",
+]
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 BASE_URL       = "https://researchga.tylerhost.net"
@@ -724,19 +755,160 @@ class GeorgiaProbateScraper(BaseScraper):
         if not decedent_name and not petitioner_name:
             print("[probate_ga]   No party data found — saving with case data only.", flush=True)
 
-        # Build doc_data dict (no GPT-4o needed — all data is on the page)
+        # ── Try to open the free Document Preview popup ────────────────────
+        # Scroll to Events section and find a petition document link
+        gpt_data = self._extract_petition_document(page, case.get("case_number", "?"))
+
+        # Merge GPT data with parties data (GPT takes priority for names/addresses)
         doc_data = {
-            "decedent_name":           decedent_name,
-            "decedent_address":        None,  # Not available on re:SearchGA
-            "date_of_death":           None,  # Not available without paid document
-            "petitioner_name":         petitioner_name,
-            "petitioner_address":      None,
-            "petitioner_phone":        None,
-            "petitioner_relationship": "Applicant/Petitioner",
+            "decedent_name":           (gpt_data.get("decedent_name") or decedent_name) if gpt_data else decedent_name,
+            "decedent_address":        gpt_data.get("decedent_address") if gpt_data else None,
+            "date_of_death":           gpt_data.get("date_of_death") if gpt_data else None,
+            "petitioner_name":         (gpt_data.get("petitioner_name") or petitioner_name) if gpt_data else petitioner_name,
+            "petitioner_address":      gpt_data.get("petitioner_address") if gpt_data else None,
+            "petitioner_phone":        gpt_data.get("petitioner_phone") if gpt_data else None,
+            "petitioner_relationship": (gpt_data.get("petitioner_relationship") or "Applicant/Petitioner") if gpt_data else "Applicant/Petitioner",
             "heirs":                   [{"name": h, "relationship": "Heir"} for h in heirs],
         }
 
+        print(f"[probate_ga]   Address:    {doc_data.get('decedent_address') or '(not extracted)'}", flush=True)
+        print(f"[probate_ga]   DOD:        {doc_data.get('date_of_death') or '(not extracted)'}", flush=True)
+        print(f"[probate_ga]   Pet. phone: {doc_data.get('petitioner_phone') or '(not extracted)'}", flush=True)
+
         return self._save_lead(case, doc_data)
+
+    # ── Document Preview extraction ──────────────────────────────────────────
+    def _extract_petition_document(self, page, case_num: str) -> Optional[dict]:
+        """
+        Scroll to the Events section, find the petition document link,
+        click it to open the free Document Preview popup,
+        take a screenshot, send to GPT-4o, return extracted dict.
+        """
+        if not _OPENAI_AVAILABLE:
+            print("[probate_ga]   OPENAI_API_KEY not set — skipping document extraction.", flush=True)
+            return None
+        if _requests is None:
+            print("[probate_ga]   requests library not available — skipping document extraction.", flush=True)
+            return None
+
+        try:
+            # Scroll to Events section
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            time.sleep(1)
+
+            # Find petition document link in Events section
+            # Links look like: "Petition for Letters of Administration.pdf" or similar
+            petition_link = None
+            all_links = page.query_selector_all("a")
+            for link in all_links:
+                try:
+                    txt = link.inner_text().strip().lower()
+                    href = link.get_attribute("href") or ""
+                    if any(kw in txt for kw in PETITION_KEYWORDS):
+                        # Only click links that are NOT behind a paywall
+                        # Free previews: links that open a popup/preview (no Add to cart)
+                        # Paid downloads: links next to a price like $6.50 or "Add" button
+                        parent_text = ""
+                        try:
+                            row = link.evaluate_handle("el => el.closest('tr, li, div')")
+                            if row:
+                                row_el = row.as_element()
+                                if row_el:
+                                    parent_text = row_el.inner_text().lower()
+                        except Exception:
+                            pass
+                        # Skip if this row has a price (paid document)
+                        if re.search(r"\$\d+\.\d+", parent_text):
+                            print(f"[probate_ga]   Skipping paid document: {txt[:60]}", flush=True)
+                            continue
+                        petition_link = link
+                        print(f"[probate_ga]   Found petition link: {txt[:80]}", flush=True)
+                        break
+                except Exception:
+                    continue
+
+            if not petition_link:
+                print("[probate_ga]   No free petition document found in Events.", flush=True)
+                return None
+
+            # Click the link — this opens a Document Preview popup
+            print("[probate_ga]   Clicking petition link to open Document Preview...", flush=True)
+            with page.expect_popup(timeout=10000) as popup_info:
+                petition_link.click()
+            popup = popup_info.value
+            popup.wait_for_load_state("domcontentloaded", timeout=15000)
+            time.sleep(2)
+
+            safe_num = re.sub(r"[^a-zA-Z0-9_-]", "_", case_num)
+            screenshot_path = f"/tmp/ga_doc_{safe_num}.png"
+            popup.screenshot(path=screenshot_path, full_page=True)
+            print(f"[probate_ga]   Document preview screenshot: {screenshot_path}", flush=True)
+
+            # Read screenshot as base64
+            with open(screenshot_path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode()
+
+            popup.close()
+
+            # Send to GPT-4o
+            return self._gpt4o_vision(b64, GA_DOC_PROMPT, case_num)
+
+        except PWTimeout:
+            print("[probate_ga]   Timeout waiting for Document Preview popup.", flush=True)
+            # Try screenshot of current page instead (popup may have opened in same tab)
+            try:
+                safe_num = re.sub(r"[^a-zA-Z0-9_-]", "_", case_num)
+                screenshot_path = f"/tmp/ga_doc_{safe_num}_inline.png"
+                page.screenshot(path=screenshot_path, full_page=True)
+                with open(screenshot_path, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode()
+                return self._gpt4o_vision(b64, GA_DOC_PROMPT, case_num)
+            except Exception as exc2:
+                print(f"[probate_ga]   Inline screenshot fallback failed: {exc2}", flush=True)
+                return None
+        except Exception as exc:
+            print(f"[probate_ga]   Document extraction error: {exc}", flush=True)
+            traceback.print_exc()
+            return None
+
+    def _gpt4o_vision(self, b64_image: str, prompt: str, label: str) -> Optional[dict]:
+        """Send a base64 PNG screenshot to GPT-4o vision via the OpenAI REST API."""
+        try:
+            payload = {
+                "model": GPT_MODEL,
+                "max_tokens": 800,
+                "temperature": 0,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:image/png;base64,{b64_image}",
+                            "detail": "high",
+                        }},
+                    ],
+                }],
+            }
+            headers = {
+                "Authorization": f"Bearer {_OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            resp = _requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=60,
+            )
+            resp.raise_for_status()
+            raw = resp.json()["choices"][0]["message"]["content"].strip()
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw).strip()
+            result = json.loads(raw)
+            print(f"[probate_ga]   GPT-4o extracted for {label}: {list(result.keys())}", flush=True)
+            return result
+        except Exception as exc:
+            print(f"[probate_ga]   GPT-4o error for {label}: {exc}", flush=True)
+            return None
 
     # ── Parse Parties table ───────────────────────────────────────────────────
     def _parse_parties_table(self, soup: BeautifulSoup, page) -> dict:
@@ -865,10 +1037,14 @@ class GeorgiaProbateScraper(BaseScraper):
                             county = c
                             break
 
-                # Build address from decedent name + county
-                # (street address not available on re:SearchGA without paid document)
+                # Use real decedent street address from GPT-4o extraction;
+                # fall back to county-level address if document was not available
                 decedent_name = doc_data.get("decedent_name") or case.get("case_name", "Unknown")
-                address = f"{decedent_name} — {county} County, GA"
+                decedent_address = doc_data.get("decedent_address") or ""
+                if decedent_address and len(decedent_address) > 10:
+                    address = decedent_address
+                else:
+                    address = f"{decedent_name} — {county} County, GA"
 
                 raw_data = {
                     "case_number":             case_num,
@@ -915,7 +1091,12 @@ class GeorgiaProbateScraper(BaseScraper):
                         source="probate",
                     ))
                     contacts_saved += 1
-                    print(f"[probate_ga]   CONTACT (petitioner): {petitioner_name}", flush=True)
+                    print(
+                        f"[probate_ga]   CONTACT (petitioner): {petitioner_name} | "
+                        f"phone={doc_data.get('petitioner_phone')} | "
+                        f"addr={doc_data.get('petitioner_address')}",
+                        flush=True,
+                    )
 
                 for heir in (doc_data.get("heirs") or []):
                     heir_name = heir.get("name") if isinstance(heir, dict) else str(heir)
