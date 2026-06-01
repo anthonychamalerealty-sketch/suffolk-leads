@@ -188,11 +188,13 @@ class GeorgiaProbateScraper(BaseScraper):
     and saves leads and contacts to the database.
     """
 
-    def __init__(self, days: int = 90):
-        self.days    = days
-        self._cutoff = datetime.date.today() - datetime.timedelta(days=days)
-        self.email   = os.environ.get("RESEARCHGA_EMAIL", "")
-        self.password = os.environ.get("RESEARCHGA_PASSWORD", "")
+    def __init__(self, days: int = 365):
+        self.days       = days
+        self._cutoff    = datetime.date.today() - datetime.timedelta(days=days)
+        self._date_from = self._cutoff.strftime("%m/%d/%Y")
+        self._date_to   = datetime.date.today().strftime("%m/%d/%Y")
+        self.email      = os.environ.get("RESEARCHGA_EMAIL", "")
+        self.password   = os.environ.get("RESEARCHGA_PASSWORD", "")
 
     def scrape(self) -> list[dict]:
         print("[probate_ga] ============================================================", flush=True)
@@ -1167,8 +1169,8 @@ class GeorgiaProbateScraper(BaseScraper):
 # ── CLI entry point ───────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Georgia Probate Scraper — re:SearchGA")
-    parser.add_argument("--days", type=int, default=90,
-                        help="How many days back to search (default: 90)")
+    parser.add_argument("--days", type=int, default=365,
+                        help="How many days back to search (default: 365)")
     args = parser.parse_args()
 
     scraper = GeorgiaProbateScraper(days=args.days)
