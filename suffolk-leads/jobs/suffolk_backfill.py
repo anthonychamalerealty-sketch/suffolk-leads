@@ -48,7 +48,13 @@ _SCRIPT_DIR   = Path(__file__).parent.resolve()
 PROGRESS_FILE = _SCRIPT_DIR / "backfill_progress.json"
 DESKTOP       = Path.home() / "Desktop"
 CSV_PATH      = DESKTOP / "backfill_results.csv"
-DB_PATH       = os.environ.get("DB_PATH", "/app/sql_app.db")
+# Use /app/sql_app.db on Railway (Docker), fall back to Desktop when running locally on Mac
+if os.environ.get("DB_PATH"):
+    DB_PATH = os.environ["DB_PATH"]
+elif os.path.exists("/app"):
+    DB_PATH = "/app/sql_app.db"
+else:
+    DB_PATH = os.path.expanduser("~/Desktop/suffolk_backfill.db")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 BASE_URL        = "https://websurrogates.nycourts.gov"
