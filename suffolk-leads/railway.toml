@@ -19,7 +19,7 @@
 builder = "Nixpacks"
 
 [deploy]
-startCommand = "python jobs/backfill_probate_ny.py"
+startCommand = "python main.py"
 
 # Ensure Python output is never buffered — critical for Railway log visibility
 [deploy.environmentVariables]
