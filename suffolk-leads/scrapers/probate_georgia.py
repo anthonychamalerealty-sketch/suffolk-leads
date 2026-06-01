@@ -21,7 +21,7 @@ Step 2 — Advanced Search
 Step 3 — Results
   Extract from every case card: case name, case number, location/court,
   case type, parties, attorney, judge, filed date
-  Filter to cases filed in the last 7 days
+  Filter to cases filed in the last 90 days
   Click each case for detail URL
 
 Step 4 — Case detail
@@ -184,7 +184,7 @@ class GeorgiaProbateScraper(BaseScraper):
     and contacts to the database.  No mock data.
     """
 
-    def __init__(self, days: int = 7):
+    def __init__(self, days: int = 90):
         self.days = days
         self.email    = os.getenv("RESEARCHGA_EMAIL", "")
         self.password = os.getenv("RESEARCHGA_PASSWORD", "")
@@ -812,15 +812,16 @@ class GeorgiaProbateScraper(BaseScraper):
         try:
             db = SessionLocal()
             try:
-                # Dedup by case_number
+                # Dedup by case_number — check for exact JSON key match
                 case_num = case.get("case_number", "")
                 if case_num:
+                    # Use JSON key pattern to avoid false positives from substring matches
                     existing = db.query(Lead).filter(
                         Lead.source == "probate",
-                        Lead.raw_data.like(f"%{case_num}%")
+                        Lead.raw_data.like(f'%"case_number": "{case_num}"%')
                     ).first()
                     if existing:
-                        print(f"[probate_ga]   DUPLICATE: {case_num} (lead id={existing.id})", flush=True)
+                        print(f"[probate_ga]   DUPLICATE: {case_num} (lead id={existing.id}) — skipping.", flush=True)
                         return 0
 
                 decedent_addr = doc_data.get("decedent_address") or ""
@@ -933,12 +934,13 @@ class GeorgiaProbateScraper(BaseScraper):
             try:
                 case_num = case.get("case_number", "")
                 if case_num:
+                    # Use JSON key pattern to avoid false positives from substring matches
                     existing = db.query(Lead).filter(
                         Lead.source == "probate",
-                        Lead.raw_data.like(f"%{case_num}%")
+                        Lead.raw_data.like(f'%"case_number": "{case_num}"%')
                     ).first()
                     if existing:
-                        print(f"[probate_ga]   DUPLICATE (no doc): {case_num}", flush=True)
+                        print(f"[probate_ga]   DUPLICATE (no doc): {case_num} — skipping.", flush=True)
                         return 0
 
                 county = case.get("county", "")
@@ -1057,8 +1059,8 @@ class GeorgiaProbateScraper(BaseScraper):
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Georgia probate scraper — re:SearchGA")
-    parser.add_argument("--days", type=int, default=7,
-                        help="Days back to search (default: 7)")
+    parser.add_argument("--days", type=int, default=90,
+                        help="Days back to search (default: 90)")
     args = parser.parse_args()
 
     scraper = GeorgiaProbateScraper(days=args.days)

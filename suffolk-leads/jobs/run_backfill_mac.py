@@ -19,10 +19,10 @@ STEP 1 — Quit Chrome completely (Cmd+Q), then relaunch it with remote
   A Chrome window will open. Leave it running.
 
 STEP 2 — In that Chrome window, navigate to:
-  https://websurrogates.nycourts.gov/File/FileSearch
+  https://websurrogates.nycourts.gov/
 
   Complete any Cloudflare challenge that appears. Once you see the
-  File Search form, you are ready.
+  homepage with a 'Start Search' button, you are ready.
 
 STEP 3 — In a SECOND Terminal tab/window, run this script:
   python3 run_backfill_mac.py
@@ -71,6 +71,7 @@ CSV_PATH      = DESKTOP / "backfill_results.csv"
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 BASE_URL        = "https://websurrogates.nycourts.gov"
+HOME_URL        = BASE_URL
 FILE_SEARCH     = f"{BASE_URL}/File/FileSearch"
 CDP_URL         = "http://localhost:9222"
 REQUEST_DELAY   = 3        # seconds between page loads
@@ -285,12 +286,34 @@ class MacBackfillScraper:
     def search_filings(self, page, court_name: str, proceeding: str,
                        date_from: str, date_to: str) -> list[dict]:
         print(f"[mac] Searching: {court_name} | {proceeding} | {date_from} → {date_to}", flush=True)
+        # Navigate via homepage then click 'Start Search' to avoid Cloudflare
         try:
-            page.goto(FILE_SEARCH, wait_until="domcontentloaded", timeout=60000)
+            page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
         except Exception as exc:
-            print(f"[mac] Timeout navigating to File Search: {exc}", flush=True)
+            print(f"[mac] Timeout navigating to homepage: {exc}", flush=True)
             return []
-        time.sleep(REQUEST_DELAY)
+        time.sleep(5)
+        try:
+            start_btn = page.query_selector(
+                "a:has-text('Start Search'), "
+                "button:has-text('Start Search'), "
+                "input[value='Start Search']"
+            )
+            if start_btn:
+                start_btn.click()
+                page.wait_for_load_state("domcontentloaded", timeout=30000)
+                time.sleep(REQUEST_DELAY)
+            else:
+                page.goto(FILE_SEARCH, wait_until="domcontentloaded", timeout=60000)
+                time.sleep(REQUEST_DELAY)
+        except Exception as exc:
+            print(f"[mac] WARNING: Homepage nav failed ({exc}) — going directly to File Search.", flush=True)
+            try:
+                page.goto(FILE_SEARCH, wait_until="domcontentloaded", timeout=60000)
+            except Exception as exc2:
+                print(f"[mac] Timeout navigating to File Search: {exc2}", flush=True)
+                return []
+            time.sleep(REQUEST_DELAY)
 
         if self._is_blocked(page):
             print("[mac] BLOCKED on File Search — Cloudflare may have returned.", flush=True)
@@ -638,10 +661,10 @@ def print_setup_instructions():
 ║        --remote-debugging-port=9222                                  ║
 ║                                                                      ║
 ║  STEP 2 — In the Chrome window that opens, navigate to:              ║
-║    https://websurrogates.nycourts.gov/File/FileSearch                ║
+║    https://websurrogates.nycourts.gov/                               ║
 ║                                                                      ║
 ║    Complete any Cloudflare challenge. Once you see the               ║
-║    File Search form, come back here.                                 ║
+║    homepage with a 'Start Search' button, come back here.            ║
 ║                                                                      ║
 ║  STEP 3 — Press Enter below to connect and start the backfill.       ║
 ║                                                                      ║
@@ -735,18 +758,47 @@ def main():
                 page = ctx.new_page()
                 print("[mac] No open tabs found — opened a new tab.", flush=True)
 
-            # Verify we can reach File Search
-            print(f"[mac] Navigating to {FILE_SEARCH} ...", flush=True)
+            # Navigate via homepage to avoid direct-URL Cloudflare triggers
+            print(f"[mac] Navigating to homepage: {HOME_URL} ...", flush=True)
             try:
-                page.goto(FILE_SEARCH, wait_until="domcontentloaded", timeout=60000)
+                page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
             except Exception as exc:
-                print(f"[mac] ERROR navigating to File Search: {exc}", flush=True)
+                print(f"[mac] ERROR navigating to homepage: {exc}", flush=True)
                 browser.close()
                 sys.exit(1)
-            time.sleep(REQUEST_DELAY)
+            time.sleep(5)  # wait 5 seconds for page to settle
 
             if scraper._is_blocked(page):
-                print("[mac] ERROR: Cloudflare is blocking the page.", flush=True)
+                print("[mac] ERROR: Cloudflare is blocking the homepage.", flush=True)
+                print("[mac] Please complete the Cloudflare challenge in Chrome, then run the script again.", flush=True)
+                browser.close()
+                sys.exit(1)
+
+            # Click the 'Start Search' button on the homepage
+            print("[mac] Clicking 'Start Search' button...", flush=True)
+            try:
+                start_btn = page.query_selector(
+                    "a:has-text('Start Search'), "
+                    "button:has-text('Start Search'), "
+                    "input[value='Start Search']"
+                )
+                if start_btn:
+                    start_btn.click()
+                    page.wait_for_load_state("domcontentloaded", timeout=30000)
+                    time.sleep(REQUEST_DELAY)
+                    print("[mac] 'Start Search' clicked — now on File Search page.", flush=True)
+                else:
+                    # Button not found — navigate directly as fallback
+                    print("[mac] 'Start Search' button not found — navigating directly to File Search.", flush=True)
+                    page.goto(FILE_SEARCH, wait_until="domcontentloaded", timeout=60000)
+                    time.sleep(REQUEST_DELAY)
+            except Exception as exc:
+                print(f"[mac] WARNING: Could not click 'Start Search': {exc} — navigating directly.", flush=True)
+                page.goto(FILE_SEARCH, wait_until="domcontentloaded", timeout=60000)
+                time.sleep(REQUEST_DELAY)
+
+            if scraper._is_blocked(page):
+                print("[mac] ERROR: Cloudflare is blocking the File Search page.", flush=True)
                 print("[mac] Please complete the Cloudflare challenge in Chrome, then run the script again.", flush=True)
                 browser.close()
                 sys.exit(1)
