@@ -185,13 +185,12 @@ class GeorgiaProbateScraper(BaseScraper):
     """
 
     def __init__(self, days: int = 90):
-        self.days = days
-        self.email    = os.getenv("RESEARCHGA_EMAIL", "")
-        self.password = os.getenv("RESEARCHGA_PASSWORD", "")
-        self._openai: Optional[_OpenAI] = None
+        self.days     = days
         self._cutoff  = datetime.date.today() - datetime.timedelta(days=days)
+        self.email    = os.environ.get("RESEARCHGA_EMAIL", "")
+        self.password = os.environ.get("RESEARCHGA_PASSWORD", "")
+        self._openai  = None
 
-    # ── Public entry point ────────────────────────────────────────────────────
     def scrape(self) -> list[dict]:
         print("[probate_ga] ============================================================", flush=True)
         print("[probate_ga] STARTING GEORGIA PROBATE SCRAPER — re:SearchGA", flush=True)
@@ -289,38 +288,55 @@ class GeorgiaProbateScraper(BaseScraper):
         print(f"[probate_ga] Home page: {page.title()}", flush=True)
         self._screenshot(page, "/tmp/ga_01_home.png")
 
-        # Click "Sign in with eFileGA Account"
-        signin_btn = page.query_selector(
-            "button:has-text('Sign in with eFileGA'), "
-            "a:has-text('Sign in with eFileGA'), "
-            "button:has-text('Sign In'), "
-            "[data-testid='signin-btn'], "
-            "button:has-text('Login')"
-        )
-        if not signin_btn:
-            # Try any button containing "sign" or "login"
-            for btn in page.query_selector_all("button, a"):
-                txt = btn.inner_text().lower()
-                if "sign in" in txt or "login" in txt or "efile" in txt:
-                    signin_btn = btn
+        # ── Try to click "Sign in" / "Login" button ────────────────────────
+        # re:SearchGA uses a React SPA — the button text varies by version.
+        # We try several selectors in priority order.
+        signin_clicked = False
+        for selector in [
+            "button:has-text('Sign in with eFileGA')",
+            "a:has-text('Sign in with eFileGA')",
+            "button:has-text('Sign In')",
+            "button:has-text('Login')",
+            "a:has-text('Sign In')",
+            "a:has-text('Login')",
+            "[data-testid='signin-btn']",
+        ]:
+            try:
+                el = page.query_selector(selector)
+                if el and el.is_visible():
+                    el.click()
+                    print(f"[probate_ga] Clicked sign-in: '{el.inner_text().strip()[:60]}'", flush=True)
+                    signin_clicked = True
+                    time.sleep(REQUEST_DELAY)
                     break
+            except Exception:
+                continue
 
-        if signin_btn:
-            print(f"[probate_ga] Clicking sign-in button: '{signin_btn.inner_text().strip()[:50]}'", flush=True)
-            signin_btn.click()
-            time.sleep(REQUEST_DELAY)
-        else:
-            print("[probate_ga] Sign-in button not found — trying direct navigation to login.", flush=True)
-            # Try common Tyler Technologies login URLs
+        if not signin_clicked:
+            # Scan all visible buttons/links for sign-in text
+            for el in page.query_selector_all("button, a"):
+                try:
+                    txt = el.inner_text().lower()
+                    if any(kw in txt for kw in ["sign in", "login", "efile"]):
+                        el.click()
+                        print(f"[probate_ga] Clicked sign-in (scan): '{txt[:60]}'", flush=True)
+                        signin_clicked = True
+                        time.sleep(REQUEST_DELAY)
+                        break
+                except Exception:
+                    continue
+
+        if not signin_clicked:
+            # Navigate directly to the login page
+            print("[probate_ga] Sign-in button not found — navigating directly to login.", flush=True)
             for login_url in [
                 f"{BASE_URL}/CourtRecordsSearch/ui/login",
                 "https://login.efiling.tylerhost.net/",
-                "https://efile.tylerhost.net/",
             ]:
                 try:
                     page.goto(login_url, wait_until="domcontentloaded", timeout=15000)
                     time.sleep(2)
-                    if page.query_selector("input[type='email'], input[name='email'], input[id*='email']"):
+                    if page.query_selector("input[type='email'], input[name='email']"):
                         break
                 except Exception:
                     continue
@@ -328,12 +344,25 @@ class GeorgiaProbateScraper(BaseScraper):
         self._screenshot(page, "/tmp/ga_02_login_page.png")
         print(f"[probate_ga] Login page: {page.title()} | {page.url}", flush=True)
 
-        # Fill email
-        email_inp = page.query_selector(
-            "input[type='email'], input[name='email'], "
-            "input[id*='email'], input[placeholder*='email' i], "
-            "input[name='username'], input[id*='username']"
-        )
+        # ── Fill email ─────────────────────────────────────────────────────
+        email_inp = None
+        for sel in [
+            "input[type='email']",
+            "input[name='email']",
+            "input[id*='email' i]",
+            "input[placeholder*='email' i]",
+            "input[name='username']",
+            "input[id*='username' i]",
+            "input[autocomplete='username']",
+        ]:
+            try:
+                el = page.query_selector(sel)
+                if el and el.is_visible():
+                    email_inp = el
+                    break
+            except Exception:
+                continue
+
         if email_inp:
             email_inp.click()
             email_inp.fill(self.email)
@@ -343,11 +372,22 @@ class GeorgiaProbateScraper(BaseScraper):
             self._screenshot(page, "/tmp/ga_02b_no_email_input.png")
             return False
 
-        # Fill password
-        pass_inp = page.query_selector(
-            "input[type='password'], input[name='password'], "
-            "input[id*='password']"
-        )
+        # ── Fill password ──────────────────────────────────────────────────
+        pass_inp = None
+        for sel in [
+            "input[type='password']",
+            "input[name='password']",
+            "input[id*='password' i]",
+            "input[autocomplete='current-password']",
+        ]:
+            try:
+                el = page.query_selector(sel)
+                if el and el.is_visible():
+                    pass_inp = el
+                    break
+            except Exception:
+                continue
+
         if pass_inp:
             pass_inp.fill(self.password)
             print("[probate_ga] Filled password.", flush=True)
@@ -355,12 +395,24 @@ class GeorgiaProbateScraper(BaseScraper):
             print("[probate_ga] ERROR: Password input not found.", flush=True)
             return False
 
-        # Submit
-        submit_btn = page.query_selector(
-            "button[type='submit'], input[type='submit'], "
-            "button:has-text('Sign In'), button:has-text('Login'), "
-            "button:has-text('Continue')"
-        )
+        # ── Submit ─────────────────────────────────────────────────────────
+        submit_btn = None
+        for sel in [
+            "button[type='submit']",
+            "input[type='submit']",
+            "button:has-text('Sign In')",
+            "button:has-text('Login')",
+            "button:has-text('Continue')",
+            "button:has-text('Next')",
+        ]:
+            try:
+                el = page.query_selector(sel)
+                if el and el.is_visible():
+                    submit_btn = el
+                    break
+            except Exception:
+                continue
+
         if submit_btn:
             submit_btn.click()
             print("[probate_ga] Submitted login form.", flush=True)
@@ -372,17 +424,16 @@ class GeorgiaProbateScraper(BaseScraper):
         self._screenshot(page, "/tmp/ga_03_after_login.png")
         print(f"[probate_ga] After login: {page.title()} | {page.url}", flush=True)
 
-        # Check for login failure
-        body_text = ""
+        # ── Check for login failure ────────────────────────────────────────
         try:
             body_text = page.inner_text("body")[:500].lower()
         except Exception:
-            pass
-        if "invalid" in body_text or "incorrect" in body_text or "failed" in body_text:
+            body_text = ""
+        if any(kw in body_text for kw in ["invalid", "incorrect", "failed", "wrong password"]):
             print("[probate_ga] ERROR: Login failed — invalid credentials.", flush=True)
             return False
 
-        # Navigate to Advanced Search to confirm login worked
+        # ── Navigate to Advanced Search to confirm login worked ────────────
         try:
             page.goto(ADV_SEARCH_URL, wait_until="domcontentloaded", timeout=30000)
             time.sleep(REQUEST_DELAY)
@@ -393,7 +444,6 @@ class GeorgiaProbateScraper(BaseScraper):
         self._screenshot(page, "/tmp/ga_04_adv_search.png")
         print(f"[probate_ga] Advanced Search: {page.title()} | {page.url}", flush=True)
 
-        # If redirected back to login, credentials were wrong
         if "login" in page.url.lower() or "signin" in page.url.lower():
             print("[probate_ga] ERROR: Redirected to login — credentials rejected.", flush=True)
             return False
@@ -406,7 +456,6 @@ class GeorgiaProbateScraper(BaseScraper):
         """Configure and run the Advanced Search, return list of case dicts."""
         print("[probate_ga] Configuring Advanced Search...", flush=True)
 
-        # Ensure we're on the Advanced Search page
         if "advancedSearch" not in page.url:
             try:
                 page.goto(ADV_SEARCH_URL, wait_until="domcontentloaded", timeout=30000)
@@ -417,21 +466,24 @@ class GeorgiaProbateScraper(BaseScraper):
 
         self._screenshot(page, "/tmp/ga_04_adv_search.png")
 
-        # Set "Search for" = Cases
-        self._select_option_by_text(page, "Cases",
-            ["select[id*='searchFor'], select[name*='searchFor']",
-             "select[id*='SearchFor'], select[name*='SearchFor']"])
-
+        # ── Set "Search for" = Cases ───────────────────────────────────────
+        self._select_option_by_text(page, "Cases", [
+            "select[id*='searchFor' i]",
+            "select[name*='searchFor' i]",
+            "select[id*='SearchFor']",
+        ])
         time.sleep(1)
 
-        # Set "Search by" = Case Location
-        self._select_option_by_text(page, "Case Location",
-            ["select[id*='searchBy'], select[name*='searchBy']",
-             "select[id*='SearchBy'], select[name*='SearchBy']"])
-
+        # ── Set "Search by" = Case Location ───────────────────────────────
+        self._select_option_by_text(page, "Case Location", [
+            "select[id*='searchBy' i]",
+            "select[name*='searchBy' i]",
+            "select[id*='SearchBy']",
+        ])
         time.sleep(1)
+        self._screenshot(page, "/tmp/ga_04b_search_by_set.png")
 
-        # Click "Select" button to open location picker
+        # ── Click "Select" button to open location picker ─────────────────
         select_btn = self._find_button(page, ["Select", "Choose Location", "Add Location"])
         if select_btn:
             select_btn.click()
@@ -442,13 +494,28 @@ class GeorgiaProbateScraper(BaseScraper):
 
         self._screenshot(page, "/tmp/ga_05_location_picker.png")
 
-        # Search for "Probate" in the location search box
-        loc_search = page.query_selector(
-            "input[placeholder*='search' i], input[placeholder*='filter' i], "
-            "input[placeholder*='location' i], input[aria-label*='search' i], "
-            "dialog input[type='text'], [role='dialog'] input[type='text']"
-        )
+        # ── Search for "Probate" in the location search box ───────────────
+        # The modal/dialog search box — try multiple selectors
+        loc_search = None
+        for sel in [
+            "[role='dialog'] input[type='text']",
+            "dialog input[type='text']",
+            ".modal input[type='text']",
+            "input[placeholder*='search' i]",
+            "input[placeholder*='filter' i]",
+            "input[aria-label*='search' i]",
+            "input[aria-label*='location' i]",
+        ]:
+            try:
+                el = page.query_selector(sel)
+                if el and el.is_visible():
+                    loc_search = el
+                    break
+            except Exception:
+                continue
+
         if loc_search:
+            loc_search.click()
             loc_search.fill("Probate")
             print("[probate_ga] Typed 'Probate' in location search.", flush=True)
             time.sleep(2)
@@ -457,7 +524,7 @@ class GeorgiaProbateScraper(BaseScraper):
 
         self._screenshot(page, "/tmp/ga_06_probate_results.png")
 
-        # Check all 7 target courts
+        # ── Check all 7 target courts ──────────────────────────────────────
         checked = 0
         for court_name in TARGET_COURTS:
             checked += self._check_court(page, court_name)
@@ -465,27 +532,25 @@ class GeorgiaProbateScraper(BaseScraper):
         print(f"[probate_ga] Checked {checked}/{len(TARGET_COURTS)} courts.", flush=True)
         self._screenshot(page, "/tmp/ga_07_courts_checked.png")
 
-        # Click "Done" or "Apply"
+        # ── Click "Done" or "Apply" ────────────────────────────────────────
         done_btn = self._find_button(page, ["Done", "Apply", "OK", "Confirm", "Close"])
         if done_btn:
             done_btn.click()
             print("[probate_ga] Clicked 'Done'.", flush=True)
             time.sleep(REQUEST_DELAY)
         else:
-            print("[probate_ga] WARNING: 'Done' button not found.", flush=True)
-            # Try pressing Escape to close dialog
+            print("[probate_ga] WARNING: 'Done' button not found — pressing Escape.", flush=True)
             page.keyboard.press("Escape")
             time.sleep(1)
 
         self._screenshot(page, "/tmp/ga_08_after_done.png")
 
-        # Click "Search"
+        # ── Click "Search" ─────────────────────────────────────────────────
         search_btn = self._find_button(page, ["Search", "Find Cases", "Run Search"])
         if search_btn:
             search_btn.click()
             print("[probate_ga] Clicked 'Search'.", flush=True)
         else:
-            # Try submit
             submit = page.query_selector("button[type='submit'], input[type='submit']")
             if submit:
                 submit.click()
@@ -494,7 +559,12 @@ class GeorgiaProbateScraper(BaseScraper):
                 print("[probate_ga] ERROR: Search button not found.", flush=True)
                 return []
 
-        time.sleep(REQUEST_DELAY + 2)
+        # Wait for results — re:SearchGA is a React SPA, results load async
+        try:
+            page.wait_for_load_state("networkidle", timeout=20000)
+        except Exception:
+            time.sleep(REQUEST_DELAY + 2)
+
         self._screenshot(page, "/tmp/ga_09_results.png")
         print(f"[probate_ga] Results page: {page.title()} | {page.url}", flush=True)
 
@@ -504,7 +574,7 @@ class GeorgiaProbateScraper(BaseScraper):
     def _check_court(self, page, court_name: str) -> int:
         """Find and check the checkbox for a given court name. Returns 1 if checked."""
         try:
-            # Try label text match
+            # Strategy 1: exact label text
             label = page.query_selector(f"label:has-text('{court_name}')")
             if label:
                 cb_id = label.get_attribute("for")
@@ -515,30 +585,32 @@ class GeorgiaProbateScraper(BaseScraper):
                         print(f"[probate_ga]   Checked: {court_name}", flush=True)
                         return 1
                 else:
-                    # Label wraps the checkbox
                     cb = label.query_selector("input[type='checkbox']")
                     if cb and not cb.is_checked():
                         cb.check()
                         print(f"[probate_ga]   Checked: {court_name}", flush=True)
                         return 1
 
-            # Try searching by text in any element
-            els = page.query_selector_all(f"[role='option']:has-text('{court_name}'), li:has-text('{court_name}')")
-            for el in els:
+            # Strategy 2: role=option or list item
+            for el in page.query_selector_all(
+                f"[role='option']:has-text('{court_name}'), "
+                f"li:has-text('{court_name}'), "
+                f"[role='listitem']:has-text('{court_name}')"
+            ):
                 cb = el.query_selector("input[type='checkbox']")
-                if not cb:
-                    # The element itself may be clickable
+                if cb:
+                    if not cb.is_checked():
+                        cb.check()
+                        print(f"[probate_ga]   Checked (option): {court_name}", flush=True)
+                        return 1
+                else:
                     el.click()
-                    print(f"[probate_ga]   Clicked: {court_name}", flush=True)
-                    return 1
-                if not cb.is_checked():
-                    cb.check()
-                    print(f"[probate_ga]   Checked: {court_name}", flush=True)
+                    print(f"[probate_ga]   Clicked (option): {court_name}", flush=True)
                     return 1
 
-            # Partial match fallback
-            keyword = court_name.split()[0]  # e.g. "FULTON"
-            for el in page.query_selector_all(f"label, li, [role='option']"):
+            # Strategy 3: partial keyword match (first word + PROBATE)
+            keyword = court_name.split()[0].upper()
+            for el in page.query_selector_all("label, li, [role='option'], [role='listitem']"):
                 try:
                     txt = el.inner_text().strip().upper()
                     if keyword in txt and "PROBATE" in txt:
@@ -565,34 +637,58 @@ class GeorgiaProbateScraper(BaseScraper):
         cases: list[dict] = []
         try:
             html = page.content()
-            # Save for debugging
             with open("/tmp/ga_results.html", "w") as f:
                 f.write(html)
             print("[probate_ga] Results HTML saved: /tmp/ga_results.html", flush=True)
 
             soup = BeautifulSoup(html, "html.parser")
 
-            # re:SearchGA renders results as cards with class names like
-            # "case-card", "search-result", or as table rows.
-            # Try multiple selectors.
-            case_elements = (
-                soup.find_all(class_=re.compile(r"case.?card|search.?result|result.?item", re.I))
-                or soup.find_all("article")
-                or soup.find_all(attrs={"data-testid": re.compile(r"case|result", re.I)})
-            )
+            # re:SearchGA renders results as React cards. Try multiple selectors.
+            # The actual class names vary by deployment version.
+            case_elements = []
 
+            # Priority 1: elements with data attributes indicating case results
+            for attr in ["data-case-id", "data-result-id", "data-id"]:
+                els = soup.find_all(attrs={attr: True})
+                if els:
+                    case_elements = els
+                    print(f"[probate_ga] Found {len(els)} case elements via [{attr}].", flush=True)
+                    break
+
+            # Priority 2: class name patterns
             if not case_elements:
-                # Fall back to table rows
-                for tbl in soup.find_all("table"):
-                    rows = tbl.find_all("tr")[1:]
-                    if rows:
-                        for row in rows:
-                            cells = row.find_all("td")
-                            if len(cells) >= 3:
-                                case_elements.append(row)
+                for pattern in [
+                    r"case.?card", r"search.?result", r"result.?item",
+                    r"case.?row", r"case.?list.?item",
+                ]:
+                    els = soup.find_all(class_=re.compile(pattern, re.I))
+                    if els:
+                        case_elements = els
+                        print(f"[probate_ga] Found {len(els)} case elements via class '{pattern}'.", flush=True)
                         break
 
-            print(f"[probate_ga] Found {len(case_elements)} case elements.", flush=True)
+            # Priority 3: article tags
+            if not case_elements:
+                els = soup.find_all("article")
+                if els:
+                    case_elements = els
+                    print(f"[probate_ga] Found {len(els)} case elements via <article>.", flush=True)
+
+            # Priority 4: table rows
+            if not case_elements:
+                for tbl in soup.find_all("table"):
+                    rows = tbl.find_all("tr")[1:]
+                    if len(rows) >= 1:
+                        case_elements = rows
+                        print(f"[probate_ga] Found {len(rows)} case elements via <table>.", flush=True)
+                        break
+
+            # Priority 5: use Playwright to get clickable case links directly
+            if not case_elements:
+                print("[probate_ga] Falling back to Playwright link extraction.", flush=True)
+                return self._parse_cases_playwright(page)
+
+            print(f"[probate_ga] Parsing {len(case_elements)} case elements...", flush=True)
 
             for el in case_elements:
                 case = self._extract_case_card(el)
@@ -604,7 +700,7 @@ class GeorgiaProbateScraper(BaseScraper):
                 if filed_date and filed_date < self._cutoff:
                     continue
 
-                # Get case detail URL
+                # Get case detail URL from the first link in the element
                 link = el.find("a", href=True)
                 if link:
                     href = link["href"]
@@ -616,11 +712,100 @@ class GeorgiaProbateScraper(BaseScraper):
                     case["case_url"] = ""
 
                 cases.append(case)
-                print(f"[probate_ga]   {case.get('case_number', '?')} | {case.get('case_name', '?')} | {case.get('filed_date', '?')} | {case.get('court', '?')}", flush=True)
+                print(
+                    f"[probate_ga]   {case.get('case_number', '?')} | "
+                    f"{case.get('case_name', '?')} | "
+                    f"{case.get('filed_date', '?')} | "
+                    f"{case.get('court', '?')}",
+                    flush=True,
+                )
 
         except Exception as exc:
             print(f"[probate_ga] ERROR parsing results: {exc}", flush=True)
             traceback.print_exc()
+
+        return cases
+
+    def _parse_cases_playwright(self, page) -> list[dict]:
+        """
+        Fallback: use Playwright to directly enumerate case links on the results
+        page, since BeautifulSoup may miss dynamically rendered React content.
+        """
+        cases: list[dict] = []
+        try:
+            # Wait for at least one case link to appear
+            page.wait_for_selector(
+                "a[href*='CaseDetail'], a[href*='caseDetail'], "
+                "a[href*='case/'], a[href*='Case/']",
+                timeout=10000,
+            )
+        except Exception:
+            print("[probate_ga] No case links found on results page.", flush=True)
+            return cases
+
+        links = page.query_selector_all(
+            "a[href*='CaseDetail'], a[href*='caseDetail'], "
+            "a[href*='case/'], a[href*='Case/']"
+        )
+        print(f"[probate_ga] Playwright found {len(links)} case links.", flush=True)
+
+        seen_urls: set[str] = set()
+        for link in links:
+            try:
+                href = link.get_attribute("href") or ""
+                if not href or href in seen_urls:
+                    continue
+                seen_urls.add(href)
+
+                case_url = href if href.startswith("http") else BASE_URL + href
+                # Try to extract case number and name from the link text or parent
+                txt = ""
+                try:
+                    txt = link.inner_text().strip()
+                except Exception:
+                    pass
+                if not txt:
+                    try:
+                        parent = link.evaluate_handle("el => el.closest('[class]')")
+                        txt = parent.as_element().inner_text().strip() if parent else ""
+                    except Exception:
+                        pass
+
+                case_num = ""
+                m = re.search(r"\b(\d{4}[-–]?(?:ES|P|PR|ADM|PROB)[-–]?\d+)\b", txt, re.I)
+                if m:
+                    case_num = m.group(1)
+
+                case_name = ""
+                m2 = re.search(r"(Estate of [A-Z][A-Za-z ,.']+)", txt)
+                if m2:
+                    case_name = m2.group(1).strip()
+
+                filed_date = ""
+                m3 = re.search(r"\b(\d{1,2}/\d{1,2}/\d{4}|\d{4}-\d{2}-\d{2})\b", txt)
+                if m3:
+                    filed_date = m3.group(1)
+
+                # Date filter
+                fd = self._parse_date(filed_date)
+                if fd and fd < self._cutoff:
+                    continue
+
+                cases.append({
+                    "case_number": case_num,
+                    "case_name":   case_name,
+                    "filed_date":  filed_date,
+                    "court":       "",
+                    "county":      "",
+                    "parties":     [],
+                    "case_type":   "Probate",
+                    "state":       "GA",
+                    "case_url":    case_url,
+                })
+                print(f"[probate_ga]   (pw) {case_num} | {case_name} | {case_url}", flush=True)
+            except Exception as exc:
+                print(f"[probate_ga]   WARNING (pw link): {exc}", flush=True)
+                continue
 
         return cases
 
@@ -631,7 +816,6 @@ class GeorgiaProbateScraper(BaseScraper):
             if not text or len(text) < 5:
                 return None
 
-            # Try structured extraction first
             case: dict = {}
 
             # Case number — patterns like "2026-ES-001234" or "2026P001234"
@@ -656,17 +840,15 @@ class GeorgiaProbateScraper(BaseScraper):
                     case["county"] = COURT_TO_COUNTY.get(court, "")
                     break
 
-            # Parties — names in the element
+            # Parties
             party_els = el.find_all(class_=re.compile(r"party|name|person", re.I))
             parties = [p.get_text(strip=True) for p in party_els if p.get_text(strip=True)]
             if parties:
                 case["parties"] = parties
 
-            # Fallback: use the full text as case_name if nothing found
             if not case.get("case_number") and not case.get("case_name"):
                 return None
 
-            # Defaults
             case.setdefault("case_number", "")
             case.setdefault("case_name", "")
             case.setdefault("filed_date", "")
@@ -698,9 +880,37 @@ class GeorgiaProbateScraper(BaseScraper):
             return 0
         time.sleep(REQUEST_DELAY)
 
-        self._screenshot(page, f"/tmp/ga_case_{case.get('case_number', 'unknown').replace('/', '_')}.png")
+        safe_num = case.get("case_number", "unknown").replace("/", "_")
+        self._screenshot(page, f"/tmp/ga_case_{safe_num}.png")
 
-        # Find petition document link
+        # ── Enrich case data from the detail page ─────────────────────────
+        try:
+            detail_html = page.content()
+            detail_soup = BeautifulSoup(detail_html, "html.parser")
+
+            # Try to find court name if not already set
+            if not case.get("court"):
+                for court in TARGET_COURTS:
+                    if court.upper() in detail_html.upper():
+                        case["court"] = court
+                        case["county"] = COURT_TO_COUNTY.get(court, "")
+                        break
+
+            # Try to find filed date if not already set
+            if not case.get("filed_date"):
+                m = re.search(r"\b(\d{1,2}/\d{1,2}/\d{4})\b", detail_html)
+                if m:
+                    case["filed_date"] = m.group(1)
+
+            # Try to find case name if not already set
+            if not case.get("case_name"):
+                m2 = re.search(r"Estate of ([A-Z][A-Za-z ,.']+)", detail_html)
+                if m2:
+                    case["case_name"] = "Estate of " + m2.group(1).strip()
+        except Exception:
+            pass
+
+        # ── Find petition document link ────────────────────────────────────
         petition_link = self._find_petition_link(page)
         if not petition_link:
             print("[probate_ga]   No petition document found — saving with case data only.", flush=True)
@@ -708,35 +918,41 @@ class GeorgiaProbateScraper(BaseScraper):
 
         print(f"[probate_ga]   Petition doc: {petition_link.inner_text().strip()[:60]}", flush=True)
 
-        # Click the document link to open Document Preview popup
+        # ── Click the document link → Document Preview popup ──────────────
+        sshot_path = f"/tmp/ga_petition_{safe_num}.png"
+        popup_success = False
+
         try:
-            with page.expect_popup(timeout=10000) as popup_info:
+            with page.expect_popup(timeout=12000) as popup_info:
                 petition_link.click()
             popup = popup_info.value
-            popup.wait_for_load_state("domcontentloaded")
+            try:
+                popup.wait_for_load_state("domcontentloaded", timeout=15000)
+            except Exception:
+                pass
             time.sleep(REQUEST_DELAY)
             print(f"[probate_ga]   Popup: {popup.title()} | {popup.url}", flush=True)
-            sshot_path = f"/tmp/ga_petition_{case.get('case_number', 'unknown').replace('/', '_')}.png"
             popup.screenshot(path=sshot_path, full_page=True)
             print(f"[probate_ga]   Screenshot: {sshot_path}", flush=True)
             popup.close()
+            popup_success = True
         except PWTimeout:
-            # No popup — try clicking and waiting for new content on same page
             print("[probate_ga]   No popup — trying same-page click.", flush=True)
+        except Exception as exc:
+            print(f"[probate_ga]   Popup error: {exc}", flush=True)
+
+        if not popup_success:
             try:
                 petition_link.click()
                 time.sleep(REQUEST_DELAY)
-                sshot_path = f"/tmp/ga_petition_{case.get('case_number', 'unknown').replace('/', '_')}.png"
                 page.screenshot(path=sshot_path, full_page=True)
                 print(f"[probate_ga]   Screenshot (same page): {sshot_path}", flush=True)
+                popup_success = True
             except Exception as exc:
                 print(f"[probate_ga]   Click error: {exc}", flush=True)
                 return self._save_no_doc(case)
-        except Exception as exc:
-            print(f"[probate_ga]   Popup error: {exc}", flush=True)
-            return self._save_no_doc(case)
 
-        # Send screenshot to GPT-4o
+        # ── Send screenshot to GPT-4o ──────────────────────────────────────
         pdf_data = self._extract_screenshot(sshot_path, case.get("case_number", ""))
         if not pdf_data:
             print("[probate_ga]   GPT-4o extraction failed — saving with case data only.", flush=True)
@@ -748,6 +964,7 @@ class GeorgiaProbateScraper(BaseScraper):
     def _find_petition_link(self, page):
         """Find the petition document link on the case detail page."""
         try:
+            # First pass: exact keyword match in link text
             for link in page.query_selector_all("a"):
                 try:
                     txt = link.inner_text().strip().lower()
@@ -756,6 +973,23 @@ class GeorgiaProbateScraper(BaseScraper):
                             return link
                 except Exception:
                     continue
+
+            # Second pass: look for document links in Events/Documents section
+            for section_sel in [
+                "[id*='event' i]", "[class*='event' i]",
+                "[id*='document' i]", "[class*='document' i]",
+                "section", "div[role='region']",
+            ]:
+                try:
+                    section = page.query_selector(section_sel)
+                    if section:
+                        for link in section.query_selector_all("a"):
+                            txt = link.inner_text().strip().lower()
+                            if "petition" in txt:
+                                return link
+                except Exception:
+                    continue
+
         except Exception as exc:
             print(f"[probate_ga]   WARNING: petition link search: {exc}", flush=True)
         return None
@@ -788,7 +1022,6 @@ class GeorgiaProbateScraper(BaseScraper):
             raw = resp.choices[0].message.content.strip()
             print(f"[probate_ga]   GPT-4o {label}: {raw[:200]}", flush=True)
 
-            # Strip markdown fences
             raw = re.sub(r"^```(?:json)?\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw).strip()
             return json.loads(raw)
@@ -812,10 +1045,9 @@ class GeorgiaProbateScraper(BaseScraper):
         try:
             db = SessionLocal()
             try:
-                # Dedup by case_number — check for exact JSON key match
+                # Dedup by case_number
                 case_num = case.get("case_number", "")
                 if case_num:
-                    # Use JSON key pattern to avoid false positives from substring matches
                     existing = db.query(Lead).filter(
                         Lead.source == "probate",
                         Lead.raw_data.like(f'%"case_number": "{case_num}"%')
@@ -832,7 +1064,6 @@ class GeorgiaProbateScraper(BaseScraper):
                     )
 
                 county = case.get("county", "")
-                # Try to derive county from court name if not set
                 if not county:
                     for court, c in COURT_TO_COUNTY.items():
                         if court.upper() in case.get("court", "").upper():
@@ -840,23 +1071,23 @@ class GeorgiaProbateScraper(BaseScraper):
                             break
 
                 raw_data = {
-                    "case_number":            case_num,
-                    "case_name":              case.get("case_name", ""),
-                    "court":                  case.get("court", ""),
-                    "case_url":               case.get("case_url", ""),
-                    "filed_date":             case.get("filed_date", ""),
-                    "case_type":              case.get("case_type", "Probate"),
-                    "state":                  "GA",
-                    "county":                 county,
-                    "decedent_name":          doc_data.get("decedent_name"),
-                    "decedent_address":       decedent_addr,
-                    "date_of_death":          doc_data.get("date_of_death"),
-                    "petitioner_name":        doc_data.get("petitioner_name"),
-                    "petitioner_address":     doc_data.get("petitioner_address"),
-                    "petitioner_relationship":doc_data.get("petitioner_relationship"),
-                    "died_intestate":         doc_data.get("died_intestate"),
-                    "heirs":                  doc_data.get("heirs", []),
-                    "parties":                case.get("parties", []),
+                    "case_number":             case_num,
+                    "case_name":               case.get("case_name", ""),
+                    "court":                   case.get("court", ""),
+                    "case_url":                case.get("case_url", ""),
+                    "filed_date":              case.get("filed_date", ""),
+                    "case_type":               case.get("case_type", "Probate"),
+                    "state":                   "GA",
+                    "county":                  county,
+                    "decedent_name":           doc_data.get("decedent_name"),
+                    "decedent_address":        decedent_addr,
+                    "date_of_death":           doc_data.get("date_of_death"),
+                    "petitioner_name":         doc_data.get("petitioner_name"),
+                    "petitioner_address":      doc_data.get("petitioner_address"),
+                    "petitioner_relationship": doc_data.get("petitioner_relationship"),
+                    "died_intestate":          doc_data.get("died_intestate"),
+                    "heirs":                   doc_data.get("heirs", []),
+                    "parties":                 case.get("parties", []),
                 }
 
                 lead = Lead(
@@ -874,9 +1105,7 @@ class GeorgiaProbateScraper(BaseScraper):
 
                 contacts_saved = 0
 
-                # Save petitioner as contact — source='petition_document' marks
-                # this as the highest-quality phone (petitioner wrote it themselves)
-                petitioner_name = doc_data.get("petitioner_name")
+                petitioner_name  = doc_data.get("petitioner_name")
                 petitioner_phone = doc_data.get("petitioner_phone")
                 if petitioner_name:
                     db.add(Contact(
@@ -888,13 +1117,12 @@ class GeorgiaProbateScraper(BaseScraper):
                     ))
                     contacts_saved += 1
                     print(
-                        f"[probate_ga]   CONTACT (petition_document): {petitioner_name} "
+                        f"[probate_ga]   CONTACT (petitioner): {petitioner_name} "
                         f"| phone={petitioner_phone or 'none'} "
                         f"| rel={doc_data.get('petitioner_relationship', '')}",
                         flush=True,
                     )
 
-                # Save all heirs as contacts
                 for heir in (doc_data.get("heirs") or []):
                     heir_name = heir.get("name") if isinstance(heir, dict) else str(heir)
                     if heir_name:
@@ -906,10 +1134,15 @@ class GeorgiaProbateScraper(BaseScraper):
                             source="probate",
                         ))
                         contacts_saved += 1
-                        print(f"[probate_ga]   CONTACT (heir): {heir_name} ({heir.get('relationship', '') if isinstance(heir, dict) else ''})", flush=True)
+                        rel = heir.get("relationship", "") if isinstance(heir, dict) else ""
+                        print(f"[probate_ga]   CONTACT (heir): {heir_name} ({rel})", flush=True)
 
                 db.commit()
-                print(f"[probate_ga]   SAVED: lead id={lead.id} | {decedent_addr} | {contacts_saved} contact(s)", flush=True)
+                print(
+                    f"[probate_ga]   SAVED: lead id={lead.id} | {decedent_addr} | "
+                    f"{contacts_saved} contact(s)",
+                    flush=True,
+                )
                 return 1
 
             except Exception as exc:
@@ -934,7 +1167,6 @@ class GeorgiaProbateScraper(BaseScraper):
             try:
                 case_num = case.get("case_number", "")
                 if case_num:
-                    # Use JSON key pattern to avoid false positives from substring matches
                     existing = db.query(Lead).filter(
                         Lead.source == "probate",
                         Lead.raw_data.like(f'%"case_number": "{case_num}"%')
@@ -993,78 +1225,80 @@ class GeorgiaProbateScraper(BaseScraper):
             try:
                 el = page.query_selector(sel_str)
                 if el:
-                    opts = el.query_selector_all("option")
-                    for opt in opts:
-                        if text.lower() in opt.inner_text().lower():
-                            el.select_option(value=opt.get_attribute("value"))
-                            print(f"[probate_ga]   Selected '{opt.inner_text().strip()}' in {sel_str}", flush=True)
-                            return
-            except Exception:
-                continue
-        # Try radio buttons or tabs
-        for btn in page.query_selector_all("button, [role='tab'], [role='radio'], label"):
-            try:
-                if text.lower() in btn.inner_text().lower():
-                    btn.click()
-                    print(f"[probate_ga]   Clicked '{text}' button/tab.", flush=True)
+                    el.select_option(label=text)
+                    print(f"[probate_ga] Selected '{text}' in {sel_str}", flush=True)
                     return
             except Exception:
                 continue
-        print(f"[probate_ga]   WARNING: Could not select '{text}'", flush=True)
+        # Fallback: find any <select> and try to select by visible text
+        for sel in page.query_selector_all("select"):
+            try:
+                sel.select_option(label=text)
+                print(f"[probate_ga] Selected '{text}' in generic <select>", flush=True)
+                return
+            except Exception:
+                continue
+        print(f"[probate_ga] WARNING: Could not select '{text}'", flush=True)
 
     def _find_button(self, page, labels: list[str]):
         for label in labels:
             for sel in [
                 f"button:has-text('{label}')",
-                f"input[value='{label}']",
-                f"[role='button']:has-text('{label}')",
                 f"a:has-text('{label}')",
+                f"[role='button']:has-text('{label}')",
+                f"input[value='{label}']",
             ]:
                 try:
                     el = page.query_selector(sel)
-                    if el:
+                    if el and el.is_visible():
                         return el
                 except Exception:
                     continue
         return None
 
     def _parse_date(self, raw: str) -> Optional[datetime.date]:
-        for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%B %d, %Y", "%b %d, %Y"):
+        if not raw:
+            return None
+        for fmt in ["%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y", "%d/%m/%Y"]:
             try:
                 return datetime.datetime.strptime(raw.strip(), fmt).date()
-            except (ValueError, AttributeError):
+            except ValueError:
                 continue
         return None
 
     def _screenshot(self, page, path: str):
         try:
-            page.screenshot(path=path)
-            print(f"[probate_ga]   Screenshot: {path}", flush=True)
-        except Exception:
-            pass
+            page.screenshot(path=path, full_page=True)
+            print(f"[probate_ga] Screenshot: {path}", flush=True)
+        except Exception as exc:
+            print(f"[probate_ga] Screenshot error: {exc}", flush=True)
 
     def _score(self, doc_data: dict) -> float:
-        score = 55.0
-        if doc_data.get("decedent_address"):  score += 15
-        if doc_data.get("petitioner_name"):   score += 10
-        if doc_data.get("petitioner_address"):score += 5
-        heirs = doc_data.get("heirs") or []
-        if heirs:
-            score += min(len(heirs) * 3, 15)
+        score = 60.0
+        addr = doc_data.get("decedent_address") or ""
+        if addr and len(addr) > 10:
+            score += 15
+        if doc_data.get("petitioner_phone"):
+            score += 10
+        if doc_data.get("heirs"):
+            score += 5
+        if doc_data.get("date_of_death"):
+            score += 5
+        if doc_data.get("petitioner_name"):
+            score += 5
         return min(score, 100.0)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────────────────
+# ── CLI entry point ───────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="Georgia probate scraper — re:SearchGA")
+    parser = argparse.ArgumentParser(description="Georgia Probate Scraper — re:SearchGA")
     parser.add_argument("--days", type=int, default=90,
-                        help="Days back to search (default: 90)")
+                        help="How many days back to search (default: 90)")
     args = parser.parse_args()
 
     scraper = GeorgiaProbateScraper(days=args.days)
-    scraper.scrape()
+    results = scraper.scrape()
+    print(f"\n[probate_ga] Returned {len(results)} leads.", flush=True)
 
 
 if __name__ == "__main__":
